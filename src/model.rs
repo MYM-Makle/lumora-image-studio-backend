@@ -262,6 +262,12 @@ pub struct GenerateRequest {
     pub model: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateImageVisibilityRequest {
+    pub is_public: bool,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditJsonRequest {
@@ -351,7 +357,7 @@ pub struct OpenAiImagesResponse {
 }
 
 pub fn default_size() -> String {
-    "auto".into()
+    "1024x1024".into()
 }
 
 pub fn default_quality() -> String {

@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         db,
         client: Client::builder()
-            .timeout(Duration::from_secs(180))
+            .timeout(Duration::from_secs(360))
             .build()?,
         task_semaphore: Arc::new(Semaphore::new(config.worker_concurrency)),
         config: config.clone(),
@@ -93,6 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/images/edit", post(images::edit_image))
         .route("/api/images/edit/async", post(images::edit_image_async))
+        .route(
+            "/api/images/{id}/visibility",
+            put(images::update_image_visibility),
+        )
         .route("/api/images/{id}", delete(images::delete_image))
         .route("/api/images/{id}/file", get(images::private_image_file))
         .route("/api/image-tasks", get(images::list_active_image_tasks))

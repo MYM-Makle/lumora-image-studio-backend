@@ -24,7 +24,7 @@ use crate::{
         api_json, api_query, api_success, default_quality, default_size, ApiResponse, AppError,
         AppResult, ConfirmTasksRequest, EditJsonRequest, EditRequest, GenerateRequest, ImageInput,
         ImageResponse, OpenAiImageData, OpenAiImagesResponse, OpenAiResult, ProviderConfiguration,
-        UpstreamResponse, UserResponse, MODEL,
+        UpdateImageVisibilityRequest, UpstreamResponse, UserResponse, MODEL,
     },
     AppState,
 };
@@ -82,6 +82,34 @@ pub async fn list_images(
     Ok(Json(api_success(json!({ "items": items }))))
 }
 
+pub async fn update_image_visibility(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    payload: Result<Json<UpdateImageVisibilityRequest>, JsonRejection>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let request = api_json(payload)?;
+    let user = user_from_headers(&headers, &state)?;
+    let visibility = if request.is_public {
+        "public"
+    } else {
+        "private"
+    };
+    let changed = database(&state.db)?
+        .execute(
+            "UPDATE images SET visibility = ?1 WHERE id = ?2 AND user_id = ?3",
+            params![visibility, id, user.id],
+        )
+        .map_err(internal_error)?;
+    if changed == 0 {
+        return Err(AppError(StatusCode::NOT_FOUND, "图片不存在".into()));
+    }
+    Ok(Json(api_success(json!({
+        "id": id,
+        "isPublic": request.is_public
+    }))))
+}
+
 pub async fn public_gallery(
     State(state): State<AppState>,
     query: Result<Query<GalleryQuery>, axum::extract::rejection::QueryRejection>,
@@ -95,7 +123,8 @@ pub async fn public_gallery(
     let total: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM images
-             WHERE (?1 = '' OR lower(prompt) LIKE '%' || lower(?1) || '%')
+             WHERE visibility = 'public'
+               AND (?1 = '' OR lower(prompt) LIKE '%' || lower(?1) || '%')
                AND (?2 = '' OR ?2 = '全部' OR category = ?2)",
             params![search, category],
             |row| row.get(0),
@@ -106,7 +135,8 @@ pub async fn public_gallery(
             "SELECT i.id, i.prompt, i.size, i.model, i.created_at, i.format,
                     i.visibility, i.category, u.name
              FROM images i JOIN users u ON u.id = i.user_id
-             WHERE (?1 = '' OR lower(i.prompt) LIKE '%' || lower(?1) || '%')
+             WHERE i.visibility = 'public'
+               AND (?1 = '' OR lower(i.prompt) LIKE '%' || lower(?1) || '%')
                AND (?2 = '' OR ?2 = '全部' OR i.category = ?2)
              ORDER BY i.created_at DESC LIMIT ?3 OFFSET ?4",
         )
@@ -193,7 +223,11 @@ async fn serve_image(
         .optional()
         .map_err(internal_error)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
-    let allowed = public || user_id.is_some_and(|value| value == record.2);
+    let allowed = if public {
+        record.3 == "public"
+    } else {
+        user_id.is_some_and(|value| value == record.2)
+    };
     if !allowed {
         return Err(AppError(StatusCode::NOT_FOUND, "图片不存在".into()));
     }
@@ -1862,7 +1896,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::Request,
-        routing::{get, post},
+        routing::{get, post, put},
         Router,
     };
     use reqwest::Client;
@@ -1891,9 +1925,10 @@ mod tests {
                 "/v1/images/generations",
                 post(move |Json(request): Json<Value>| {
                     let fields = request.as_object().unwrap();
-                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields.len(), 3);
                     assert_eq!(request["model"], MODEL);
                     assert_eq!(request["prompt"], "A test image");
+                    assert_eq!(request["size"], "1024x1024");
                     assert!(request.get("n").is_none());
                     let response = generation_response.clone();
                     async move { Json(response) }
@@ -2271,6 +2306,140 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn updates_image_visibility_for_its_owner() {
+        let (_directory, state, user) = test_state(1).await;
+        let now = Utc::now().to_rfc3339();
+        let connection = database(&state.db).unwrap();
+        connection
+            .execute(
+                "INSERT INTO images (
+                   id, user_id, file_name, prompt, size, model, created_at,
+                   visibility, format, category
+                 ) VALUES ('private-image', ?1, 'private.png', 'test', '1024x1024',
+                           ?2, ?3, 'private', 'png', 'test')",
+                params![user.id, MODEL, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('visibility-session', ?1, ?2, '2099-01-01T00:00:00Z')",
+                params![user.id, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let app = Router::new()
+            .route("/api/images/{id}/visibility", put(update_image_visibility))
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/images/private-image/visibility")
+                    .header(header::COOKIE, "lumora_session=visibility-session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"isPublic":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(body["data"]["isPublic"], true);
+        let visibility: String = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT visibility FROM images WHERE id = 'private-image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visibility, "public");
+    }
+
+    #[tokio::test]
+    async fn excludes_private_images_from_public_endpoints() {
+        let (_directory, state, user) = test_state(1).await;
+        let now = Utc::now().to_rfc3339();
+        let connection = database(&state.db).unwrap();
+        for (id, visibility) in [("public-image", "public"), ("private-image", "private")] {
+            let file_name = format!("{id}.png");
+            std_fs::write(state.config.image_directory.join(&file_name), png_bytes()).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO images (
+                       id, user_id, file_name, prompt, size, model, created_at,
+                       visibility, format, category
+                     ) VALUES (?1, ?2, ?3, ?4, '1024x1024', ?5, ?6, ?7, 'png', 'test')",
+                    params![id, user.id, file_name, id, MODEL, now, visibility],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let app = Router::new()
+            .route("/api/gallery", get(public_gallery))
+            .route("/api/stats", get(crate::account::public_stats))
+            .route("/public/images/{id}", get(public_image_file))
+            .with_state(state);
+        let gallery_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/gallery")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let gallery: Value =
+            serde_json::from_slice(&to_bytes(gallery_response.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(gallery["data"]["total"], 1);
+        assert_eq!(gallery["data"]["items"][0]["id"], "public-image");
+
+        let stats_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stats: Value =
+            serde_json::from_slice(&to_bytes(stats_response.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(stats["data"]["publicImages"], 1);
+        assert_eq!(stats["data"]["categories"][0]["count"], 1);
+
+        let private_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/public/images/private-image")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(private_response.status(), StatusCode::NOT_FOUND);
+        let public_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/public/images/public-image")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
