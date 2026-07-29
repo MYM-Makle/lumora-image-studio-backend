@@ -1,4 +1,12 @@
-use std::{env, fs, io::Write, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    io::{self, Write},
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand_core::{OsRng, RngCore};
@@ -19,23 +27,67 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_with_args(env::args_os().skip(1))
+    }
+
+    fn load_with_args(
+        arguments: impl IntoIterator<Item = OsString>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut data_override = None;
+        let mut image_override = None;
+        let mut task_override = None;
+        let mut static_override = None;
+        let mut master_key_file = None;
+        let mut arguments = arguments.into_iter();
+        while let Some(argument) = arguments.next() {
+            let Some(name) = argument.to_str() else {
+                continue;
+            };
+            if !name.starts_with("--desktop-") {
+                continue;
+            }
+            let value = arguments.next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing value for {name}"),
+                )
+            })?;
+            match name {
+                "--desktop-data" => data_override = Some(PathBuf::from(value)),
+                "--desktop-images" => image_override = Some(PathBuf::from(value)),
+                "--desktop-tasks" => task_override = Some(PathBuf::from(value)),
+                "--desktop-static" => static_override = Some(PathBuf::from(value)),
+                "--desktop-master-key-file" => master_key_file = Some(PathBuf::from(value)),
+                _ => {}
+            }
+        }
+
         let server_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let production = env::var("LUMORA_ENV").is_ok_and(|value| value == "production");
-        let data_directory = env::var_os("LUMORA_DATA_DIR")
-            .map(PathBuf::from)
+        let data_directory = data_override
+            .or_else(|| env::var_os("LUMORA_DATA_DIR").map(PathBuf::from))
             .unwrap_or_else(|| server_directory.join("data"));
-        let image_directory = data_directory.join("images");
-        let task_directory = data_directory.join("tasks");
+        let image_directory = image_override.unwrap_or_else(|| data_directory.join("images"));
+        let task_directory = task_override.unwrap_or_else(|| data_directory.join("tasks"));
+        fs::create_dir_all(&data_directory)?;
         fs::create_dir_all(&image_directory)?;
         fs::create_dir_all(&task_directory)?;
 
         let bind = SocketAddr::from_str(
             &env::var("LUMORA_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into()),
         )?;
-        let static_directory = env::var_os("LUMORA_STATIC_DIR")
-            .map(PathBuf::from)
+        let static_directory = static_override
+            .or_else(|| env::var_os("LUMORA_STATIC_DIR").map(PathBuf::from))
             .unwrap_or_else(|| server_directory.join("static"));
-        let master_key = load_master_key(&data_directory, production)?;
+        let master_key = match master_key_file {
+            Some(path) => fs::read(path)?.try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "desktop master key must contain exactly 32 bytes",
+                )
+            })?,
+            None => load_master_key(&data_directory, production)?,
+        };
         let worker_concurrency = env::var("LUMORA_WORKER_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -54,6 +106,46 @@ impl Config {
             support_email: non_empty_env("LUMORA_SUPPORT_EMAIL"),
             support_wechat: non_empty_env("LUMORA_SUPPORT_WECHAT"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_paths_apply_before_initialization() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary_directory = tempfile::tempdir()?;
+        let data_directory = temporary_directory.path().join("data");
+        let image_directory = temporary_directory.path().join("images");
+        let task_directory = temporary_directory.path().join("tasks");
+        let static_directory = temporary_directory.path().join("web");
+        let master_key_file = temporary_directory.path().join("desktop.key");
+        fs::write(&master_key_file, [7_u8; 32])?;
+
+        let config = Config::load_with_args([
+            OsString::from("--desktop-data"),
+            data_directory.clone().into_os_string(),
+            OsString::from("--desktop-images"),
+            image_directory.clone().into_os_string(),
+            OsString::from("--desktop-tasks"),
+            task_directory.clone().into_os_string(),
+            OsString::from("--desktop-static"),
+            static_directory.clone().into_os_string(),
+            OsString::from("--desktop-master-key-file"),
+            master_key_file.into_os_string(),
+        ])?;
+
+        assert_eq!(config.data_directory, data_directory);
+        assert_eq!(config.image_directory, image_directory);
+        assert_eq!(config.task_directory, task_directory);
+        assert_eq!(config.static_directory, static_directory);
+        assert_eq!(config.master_key, [7_u8; 32]);
+        assert!(config.data_directory.is_dir());
+        assert!(config.image_directory.is_dir());
+        assert!(config.task_directory.is_dir());
+        assert!(!config.data_directory.join("master.key").exists());
+        Ok(())
     }
 }
 
