@@ -6,7 +6,7 @@ mod images;
 mod model;
 mod security;
 
-use std::{sync::Arc, time::Duration};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -32,6 +32,44 @@ pub struct AppState {
     task_semaphore: Arc<Semaphore>,
 }
 
+fn apply_desktop_overrides(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
+        let Some(name) = argument.to_str() else {
+            continue;
+        };
+        if !name.starts_with("--desktop-") {
+            continue;
+        }
+        let value = arguments.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("missing value for {name}"),
+            )
+        })?;
+        match name {
+            "--desktop-data" => config.data_directory = PathBuf::from(value),
+            "--desktop-images" => config.image_directory = PathBuf::from(value),
+            "--desktop-tasks" => config.task_directory = PathBuf::from(value),
+            "--desktop-static" => config.static_directory = PathBuf::from(value),
+            "--desktop-master-key-file" => {
+                let key = std::fs::read(value)?;
+                config.master_key = key.try_into().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "desktop master key must contain exactly 32 bytes",
+                    )
+                })?;
+            }
+            _ => {}
+        }
+    }
+    std::fs::create_dir_all(&config.data_directory)?;
+    std::fs::create_dir_all(&config.image_directory)?;
+    std::fs::create_dir_all(&config.task_directory)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
@@ -42,7 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    apply_desktop_overrides(&mut config)?;
     let db = open_database(&config.data_directory, &config.master_key)?;
     let state = AppState {
         db,
