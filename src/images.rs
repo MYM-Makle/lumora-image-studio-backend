@@ -1,8 +1,11 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, time::Instant};
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{rejection::JsonRejection, FromRequest, Multipart, Path as AxumPath, Query, State},
+    extract::{
+        rejection::JsonRejection, ConnectInfo, FromRequest, Multipart, Path as AxumPath, Query,
+        State,
+    },
     http::{header, HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -46,6 +49,17 @@ struct GenerationResult {
     errors: Vec<String>,
 }
 
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestMetadata {
+    ip_address: String,
+    device_id: String,
+    platform: String,
+    app_version: String,
+    user_agent: String,
+    desktop: bool,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GalleryQuery {
@@ -60,6 +74,42 @@ struct TaskPayload {
     generation: GenerateRequest,
     input_files: Vec<String>,
     mask_file: Option<String>,
+    #[serde(default)]
+    request_metadata: RequestMetadata,
+}
+
+fn request_metadata(headers: &HeaderMap, peer_addr: SocketAddr) -> RequestMetadata {
+    let trusted_proxy = match peer_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    };
+    let forwarded_ip = trusted_proxy
+        .then(|| header_text(headers, "x-forwarded-for", 64))
+        .flatten()
+        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_owned))
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            trusted_proxy
+                .then(|| header_text(headers, "x-real-ip", 64))
+                .flatten()
+        });
+    RequestMetadata {
+        ip_address: forwarded_ip.unwrap_or_else(|| peer_addr.ip().to_string()),
+        device_id: header_text(headers, "x-lumora-device-id", 128).unwrap_or_default(),
+        platform: header_text(headers, "x-lumora-platform", 64).unwrap_or_default(),
+        app_version: header_text(headers, "x-lumora-app-version", 32).unwrap_or_default(),
+        user_agent: header_text(headers, "user-agent", 300).unwrap_or_default(),
+        desktop: header_text(headers, "x-lumora-client", 32).as_deref() == Some("desktop"),
+    }
+}
+
+fn header_text(headers: &HeaderMap, name: &str, max_len: usize) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(max_len).collect())
 }
 
 pub async fn list_images(
@@ -67,15 +117,21 @@ pub async fn list_images(
     headers: HeaderMap,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let user = user_from_headers(&headers, &state)?;
+    let device_id = header_text(&headers, "x-lumora-device-id", 128).unwrap_or_default();
     let connection = database(&state.db)?;
     let mut statement = connection
         .prepare(
-            "SELECT id, prompt, size, model, created_at, format, visibility, category
-             FROM images WHERE user_id = ?1 ORDER BY created_at DESC",
+            "SELECT id, prompt, size, model, created_at, format, visibility, category,
+                    storage
+             FROM images
+             WHERE user_id = ?1 AND (storage = 'server' OR device_id = ?2)
+             ORDER BY created_at DESC",
         )
         .map_err(internal_error)?;
     let items = statement
-        .query_map([user.id], |row| image_from_row(row, false, None))
+        .query_map(params![user.id, device_id], |row| {
+            image_from_row(row, false, None)
+        })
         .map_err(internal_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(internal_error)?;
@@ -110,6 +166,60 @@ pub async fn update_image_visibility(
     }))))
 }
 
+pub async fn localize_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let user = user_from_headers(&headers, &state)?;
+    let device_id = header_text(&headers, "x-lumora-device-id", 128)
+        .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "设备 ID 缺失".into()))?;
+    let record = database(&state.db)?
+        .query_row(
+            "SELECT file_name, storage, device_id
+             FROM images WHERE id = ?1 AND user_id = ?2",
+            params![id, user.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
+    if record.2 != device_id {
+        return Err(AppError(StatusCode::CONFLICT, "图片不属于当前设备".into()));
+    }
+    if record.1 == "pending" {
+        database(&state.db)?
+            .execute(
+                "UPDATE images
+                 SET storage = 'local', visibility = 'private'
+                 WHERE id = ?1 AND user_id = ?2 AND storage = 'pending' AND device_id = ?3",
+                params![id, user.id, device_id],
+            )
+            .map_err(internal_error)?;
+    } else if record.1 != "local" {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "该图片不是桌面端待转存图片".into(),
+        ));
+    }
+    if let Err(error) = fs::remove_file(state.config.image_directory.join(record.0)).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!(error = %error, image_id = id, "temporary image cleanup failed");
+        }
+    }
+    Ok(Json(api_success(json!({
+        "id": id,
+        "storage": "local",
+        "isPublic": false
+    }))))
+}
+
 pub async fn public_gallery(
     State(state): State<AppState>,
     query: Result<Query<GalleryQuery>, axum::extract::rejection::QueryRejection>,
@@ -123,7 +233,7 @@ pub async fn public_gallery(
     let total: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM images
-             WHERE visibility = 'public'
+             WHERE visibility = 'public' AND storage = 'server'
                AND (?1 = '' OR lower(prompt) LIKE '%' || lower(?1) || '%')
                AND (?2 = '' OR ?2 = '全部' OR category = ?2)",
             params![search, category],
@@ -133,9 +243,9 @@ pub async fn public_gallery(
     let mut statement = connection
         .prepare(
             "SELECT i.id, i.prompt, i.size, i.model, i.created_at, i.format,
-                    i.visibility, i.category, u.name
+                    i.visibility, i.category, i.storage, u.name
              FROM images i JOIN users u ON u.id = i.user_id
-             WHERE i.visibility = 'public'
+             WHERE i.visibility = 'public' AND i.storage = 'server'
                AND (?1 = '' OR lower(i.prompt) LIKE '%' || lower(?1) || '%')
                AND (?2 = '' OR ?2 = '全部' OR i.category = ?2)
              ORDER BY i.created_at DESC LIMIT ?3 OFFSET ?4",
@@ -145,7 +255,7 @@ pub async fn public_gallery(
         .query_map(
             params![search, category, page_size, (page - 1) * page_size],
             |row| {
-                let author: String = row.get(8)?;
+                let author: String = row.get(9)?;
                 image_from_row(row, true, Some(author))
             },
         )
@@ -181,6 +291,7 @@ fn image_from_row(
         format: row.get(5)?,
         is_public: row.get::<_, String>(6)? == "public",
         category: row.get(7)?,
+        storage: row.get(8)?,
         author,
     })
 }
@@ -209,7 +320,8 @@ async fn serve_image(
 ) -> AppResult<Response> {
     let record = database(&state.db)?
         .query_row(
-            "SELECT file_name, format, user_id, visibility FROM images WHERE id = ?1",
+            "SELECT file_name, format, user_id, visibility, storage
+             FROM images WHERE id = ?1",
             [id],
             |row| {
                 Ok((
@@ -217,6 +329,7 @@ async fn serve_image(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )
@@ -224,9 +337,9 @@ async fn serve_image(
         .map_err(internal_error)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
     let allowed = if public {
-        record.3 == "public"
+        record.3 == "public" && record.4 == "server"
     } else {
-        user_id.is_some_and(|value| value == record.2)
+        user_id.is_some_and(|value| value == record.2) && record.4 != "local"
     };
     if !allowed {
         return Err(AppError(StatusCode::NOT_FOUND, "图片不存在".into()));
@@ -254,13 +367,23 @@ async fn serve_image(
 
 pub async fn generate_image(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     payload: Result<Json<GenerateRequest>, JsonRejection>,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let request = api_json(payload)?;
     let user = user_from_headers(&headers, &state)?;
-    let result =
-        perform_generation(&state, &user, request, "/api/images/generate", None, false).await?;
+    let metadata = request_metadata(&headers, peer_addr);
+    let result = perform_generation(
+        &state,
+        &user,
+        request,
+        &metadata,
+        "/api/images/generate",
+        None,
+        false,
+    )
+    .await?;
     Ok(Json(api_success(json!({
         "images": result.images,
         "credits": result.credits,
@@ -270,6 +393,7 @@ pub async fn generate_image(
 
 pub async fn generate_image_async(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     payload: Result<Json<GenerateRequest>, JsonRejection>,
 ) -> AppResult<(StatusCode, Json<ApiResponse<Value>>)> {
@@ -277,7 +401,8 @@ pub async fn generate_image_async(
     let user = user_from_headers(&headers, &state)?;
     validate_generation(&request)?;
     active_provider(&state, &user.id)?;
-    let task_ids = create_tasks(&state, &user, "generation", request, None).await?;
+    let metadata = request_metadata(&headers, peer_addr);
+    let task_ids = create_tasks(&state, &user, "generation", request, None, metadata).await?;
     let items = task_summaries(&state, &user.id, &task_ids)?;
     Ok((
         StatusCode::ACCEPTED,
@@ -287,12 +412,23 @@ pub async fn generate_image_async(
 
 pub async fn edit_image(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let headers = request.headers().clone();
     let user = user_from_headers(&headers, &state)?;
+    let metadata = request_metadata(&headers, peer_addr);
     let edit = parse_edit_request(&state, request).await?;
-    let result = perform_edit(&state, &user, edit, "/api/images/edit", None, false).await?;
+    let result = perform_edit(
+        &state,
+        &user,
+        edit,
+        &metadata,
+        "/api/images/edit",
+        None,
+        false,
+    )
+    .await?;
     Ok(Json(api_success(json!({
         "images": result.images,
         "credits": result.credits,
@@ -302,16 +438,18 @@ pub async fn edit_image(
 
 pub async fn edit_image_async(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> AppResult<(StatusCode, Json<ApiResponse<Value>>)> {
     let headers = request.headers().clone();
     let user = user_from_headers(&headers, &state)?;
+    let metadata = request_metadata(&headers, peer_addr);
     let edit = parse_edit_request(&state, request).await?;
     validate_generation(&edit.generation)?;
     validate_edit_inputs(&edit)?;
     active_provider(&state, &user.id)?;
     let generation = edit.generation.clone();
-    let task_ids = create_tasks(&state, &user, "edit", generation, Some(edit)).await?;
+    let task_ids = create_tasks(&state, &user, "edit", generation, Some(edit), metadata).await?;
     let items = task_summaries(&state, &user.id, &task_ids)?;
     Ok((
         StatusCode::ACCEPTED,
@@ -321,15 +459,18 @@ pub async fn edit_image_async(
 
 pub async fn external_generate(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     payload: Result<Json<GenerateRequest>, JsonRejection>,
 ) -> OpenAiResult<Json<OpenAiImagesResponse>> {
     let request = external_json(payload)?;
     let principal = user_from_api_key(&headers, &state, &["generate", "full"])?;
+    let metadata = request_metadata(&headers, peer_addr);
     let result = perform_generation(
         &state,
         &principal.user,
         request,
+        &metadata,
         "/v1/images/generations",
         None,
         false,
@@ -350,16 +491,19 @@ fn external_json<T>(payload: Result<Json<T>, JsonRejection>) -> OpenAiResult<T> 
 
 pub async fn external_edit(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> OpenAiResult<Json<OpenAiImagesResponse>> {
     let headers = request.headers().clone();
     let principal = user_from_api_key(&headers, &state, &["generate", "full"])?;
+    let metadata = request_metadata(&headers, peer_addr);
     let mut edit = parse_edit_request(&state, request).await?;
     edit.batch = false;
     let result = perform_edit(
         &state,
         &principal.user,
         edit,
+        &metadata,
         "/v1/images/edits",
         None,
         false,
@@ -384,6 +528,7 @@ async fn perform_generation(
     state: &AppState,
     user: &UserResponse,
     request: GenerateRequest,
+    metadata: &RequestMetadata,
     endpoint: &str,
     task_id: Option<&str>,
     credit_already_reserved: bool,
@@ -428,6 +573,7 @@ async fn perform_generation(
             &user.id,
             Some(&provider.id),
             request.n as i64,
+            metadata,
             endpoint,
             duration_ms,
             task_id,
@@ -440,6 +586,7 @@ async fn perform_generation(
         user,
         &provider,
         &request,
+        metadata,
         outputs,
         request.n as i64,
         endpoint,
@@ -455,6 +602,7 @@ async fn perform_edit(
     state: &AppState,
     user: &UserResponse,
     request: EditRequest,
+    metadata: &RequestMetadata,
     endpoint: &str,
     task_id: Option<&str>,
     credit_already_reserved: bool,
@@ -529,6 +677,7 @@ async fn perform_edit(
             &user.id,
             Some(&provider.id),
             reserved,
+            metadata,
             endpoint,
             duration_ms,
             task_id,
@@ -541,6 +690,7 @@ async fn perform_edit(
         user,
         &provider,
         &request.generation,
+        metadata,
         outputs,
         reserved,
         endpoint,
@@ -699,6 +849,7 @@ async fn store_outputs(
     user: &UserResponse,
     provider: &ProviderConfiguration,
     request: &GenerateRequest,
+    metadata: &RequestMetadata,
     outputs: Vec<GeneratedOutput>,
     reserved: i64,
     endpoint: &str,
@@ -723,6 +874,7 @@ async fn store_outputs(
                 &user.id,
                 Some(&provider.id),
                 reserved,
+                metadata,
                 endpoint,
                 duration_ms,
                 task_id,
@@ -743,6 +895,18 @@ async fn store_outputs(
     } else {
         "private"
     };
+    let storage = if metadata.desktop && !metadata.device_id.is_empty() {
+        "pending"
+    } else {
+        "server"
+    };
+    let device_id = if storage == "pending" {
+        metadata.device_id.as_str()
+    } else {
+        ""
+    };
+    let usage_log_id = format!("log-{}", Uuid::new_v4().simple());
+    let credit_reference = format!("generation:{}", task_id.unwrap_or(&usage_log_id));
     let transaction_result = (|| -> AppResult<()> {
         let mut connection = database(&state.db)?;
         let transaction = connection
@@ -759,13 +923,35 @@ async fn store_outputs(
         if changed == 0 {
             return Err(AppError(StatusCode::CONFLICT, "积分结算状态冲突".into()));
         }
+        let balance = transaction
+            .query_row(
+                "SELECT credits FROM users WHERE id = ?1",
+                [&user.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        transaction
+            .execute(
+                "INSERT INTO credit_ledger (
+                   id, user_id, delta, balance_after, reason, reference_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'image_generation', ?5, ?6)",
+                params![
+                    format!("credit-{}", Uuid::new_v4().simple()),
+                    user.id,
+                    -used,
+                    balance,
+                    credit_reference,
+                    created_at
+                ],
+            )
+            .map_err(internal_error)?;
         for (image_id, file_name, _, _, format) in &files {
             transaction
                 .execute(
                     "INSERT INTO images (
                        id, user_id, file_name, prompt, size, model, created_at,
-                       visibility, format, category
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                       visibility, format, category, storage, device_id
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         image_id,
                         user.id,
@@ -776,7 +962,9 @@ async fn store_outputs(
                         created_at,
                         visibility,
                         format,
-                        category
+                        category,
+                        storage,
+                        device_id
                     ],
                 )
                 .map_err(internal_error)?;
@@ -785,16 +973,23 @@ async fn store_outputs(
             .execute(
                 "INSERT INTO usage_logs (
                    id, user_id, provider_id, endpoint, model, status,
-                   duration_ms, credits_used, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'success', ?6, ?7, ?8)",
+                   duration_ms, credits_used, ip_address, device_id, platform,
+                   app_version, user_agent, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, 'success', ?6, ?7, ?8, ?9,
+                          ?10, ?11, ?12, ?13)",
                 params![
-                    format!("log-{}", Uuid::new_v4().simple()),
+                    usage_log_id,
                     user.id,
                     provider.id,
                     endpoint,
                     MODEL,
                     duration_ms,
                     used,
+                    metadata.ip_address,
+                    metadata.device_id,
+                    metadata.platform,
+                    metadata.app_version,
+                    metadata.user_agent,
                     created_at
                 ],
             )
@@ -820,6 +1015,7 @@ async fn store_outputs(
             &user.id,
             Some(&provider.id),
             reserved,
+            metadata,
             endpoint,
             duration_ms,
             task_id,
@@ -848,6 +1044,7 @@ async fn store_outputs(
             format: format.clone(),
             is_public: request.is_public,
             category: category.into(),
+            storage: storage.into(),
             author: None,
         })
         .collect();
@@ -901,6 +1098,7 @@ fn settle_failure(
     user_id: &str,
     provider_id: Option<&str>,
     reserved: i64,
+    metadata: &RequestMetadata,
     endpoint: &str,
     duration_ms: i64,
     task_id: Option<&str>,
@@ -921,8 +1119,10 @@ fn settle_failure(
         .execute(
             "INSERT INTO usage_logs (
                id, user_id, provider_id, endpoint, model, status,
-               duration_ms, credits_used, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'error', ?6, 0, ?7)",
+               duration_ms, credits_used, ip_address, device_id, platform,
+               app_version, user_agent, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'error', ?6, 0, ?7, ?8, ?9,
+                       ?10, ?11, ?12)",
             params![
                 format!("log-{}", Uuid::new_v4().simple()),
                 user_id,
@@ -930,6 +1130,11 @@ fn settle_failure(
                 endpoint,
                 MODEL,
                 duration_ms,
+                metadata.ip_address,
+                metadata.device_id,
+                metadata.platform,
+                metadata.app_version,
+                metadata.user_agent,
                 Utc::now().to_rfc3339()
             ],
         )
@@ -1276,21 +1481,21 @@ pub async fn delete_image(
     AxumPath(id): AxumPath<String>,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let user = user_from_headers(&headers, &state)?;
-    let file_name = database(&state.db)?
+    let record = database(&state.db)?
         .query_row(
-            "SELECT file_name FROM images WHERE id = ?1 AND user_id = ?2",
+            "SELECT file_name, storage FROM images WHERE id = ?1 AND user_id = ?2",
             params![id, user.id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(internal_error)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
-    let original = state.config.image_directory.join(&file_name);
+    let original = state.config.image_directory.join(&record.0);
     let trash = state
         .config
         .image_directory
         .join(format!(".deleting-{}", Uuid::new_v4().simple()));
-    let renamed = fs::rename(&original, &trash).await.is_ok();
+    let renamed = record.1 != "local" && fs::rename(&original, &trash).await.is_ok();
     let changed = database(&state.db)?
         .execute(
             "DELETE FROM images WHERE id = ?1 AND user_id = ?2",
@@ -1317,7 +1522,7 @@ pub async fn clear_images(
     let file_names = {
         let connection = database(&state.db)?;
         let mut statement = connection
-            .prepare("SELECT file_name FROM images WHERE user_id = ?1")
+            .prepare("SELECT file_name FROM images WHERE user_id = ?1 AND storage != 'local'")
             .map_err(internal_error)?;
         let file_names = statement
             .query_map([&user.id], |row| row.get::<_, String>(0))
@@ -1356,6 +1561,7 @@ pub async fn clear_images(
 
 pub async fn external_generate_async(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     payload: Result<Json<GenerateRequest>, JsonRejection>,
 ) -> OpenAiResult<(StatusCode, Json<Value>)> {
@@ -1363,7 +1569,16 @@ pub async fn external_generate_async(
     let principal = user_from_api_key(&headers, &state, &["generate", "full"])?;
     validate_generation(&request)?;
     active_provider(&state, &principal.user.id)?;
-    let task_ids = create_tasks(&state, &principal.user, "generation", request, None).await?;
+    let metadata = request_metadata(&headers, peer_addr);
+    let task_ids = create_tasks(
+        &state,
+        &principal.user,
+        "generation",
+        request,
+        None,
+        metadata,
+    )
+    .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
@@ -1376,16 +1591,26 @@ pub async fn external_generate_async(
 
 pub async fn external_edit_async(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> OpenAiResult<(StatusCode, Json<Value>)> {
     let headers = request.headers().clone();
     let principal = user_from_api_key(&headers, &state, &["generate", "full"])?;
+    let metadata = request_metadata(&headers, peer_addr);
     let edit = parse_edit_request(&state, request).await?;
     validate_generation(&edit.generation)?;
     validate_edit_inputs(&edit)?;
     active_provider(&state, &principal.user.id)?;
     let generation = edit.generation.clone();
-    let task_ids = create_tasks(&state, &principal.user, "edit", generation, Some(edit)).await?;
+    let task_ids = create_tasks(
+        &state,
+        &principal.user,
+        "edit",
+        generation,
+        Some(edit),
+        metadata,
+    )
+    .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
@@ -1402,6 +1627,7 @@ async fn create_tasks(
     kind: &str,
     generation: GenerateRequest,
     edit: Option<EditRequest>,
+    metadata: RequestMetadata,
 ) -> AppResult<Vec<String>> {
     let count = edit
         .as_ref()
@@ -1454,6 +1680,7 @@ async fn create_tasks(
                 generation: task_generation,
                 input_files,
                 mask_file,
+                request_metadata: metadata.clone(),
             };
             tasks.push((
                 id,
@@ -1472,6 +1699,7 @@ async fn create_tasks(
             &user.id,
             None,
             count as i64,
+            &metadata,
             "/v1/tasks",
             0,
             None,
@@ -1507,6 +1735,7 @@ async fn create_tasks(
             &user.id,
             None,
             count as i64,
+            &metadata,
             "/v1/tasks",
             0,
             None,
@@ -1578,14 +1807,20 @@ async fn run_task(state: &AppState, id: &str) -> AppResult<()> {
             params![Utc::now().to_rfc3339(), id],
         )
         .map_err(internal_error)?;
+    let payload = serde_json::from_str::<TaskPayload>(&payload_json)
+        .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "任务数据无效".into()));
+    let metadata = payload
+        .as_ref()
+        .map(|payload| payload.request_metadata.clone())
+        .unwrap_or_default();
     let result = async {
-        let payload: TaskPayload = serde_json::from_str(&payload_json)
-            .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "任务数据无效".into()))?;
+        let payload = payload?;
         if kind == "generation" {
             perform_generation(
                 state,
                 &user,
                 payload.generation,
+                &metadata,
                 "/v1/images/generations/async",
                 Some(id),
                 true,
@@ -1609,6 +1844,7 @@ async fn run_task(state: &AppState, id: &str) -> AppResult<()> {
                     mask,
                     batch: false,
                 },
+                &metadata,
                 "/v1/images/edits/async",
                 Some(id),
                 true,
@@ -1627,7 +1863,17 @@ async fn run_task(state: &AppState, id: &str) -> AppResult<()> {
             .optional()
             .map_err(internal_error)?;
         if status.as_deref() == Some("running") {
-            settle_failure(state, &user_id, None, 1, "/v1/tasks", 0, Some(id), &error.1)?;
+            settle_failure(
+                state,
+                &user_id,
+                None,
+                1,
+                &metadata,
+                "/v1/tasks",
+                0,
+                Some(id),
+                &error.1,
+            )?;
         }
         return Err(error);
     }
@@ -1897,7 +2143,7 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
         routing::{get, post, put},
-        Router,
+        Extension, Router,
     };
     use reqwest::Client;
     use std::{fs as std_fs, sync::Arc, time::Duration};
@@ -2029,10 +2275,19 @@ mod tests {
     #[tokio::test]
     async fn generates_and_batch_edits_with_mock_upstream() {
         let (_directory, state, user) = test_state(10).await;
+        let metadata = RequestMetadata {
+            ip_address: "203.0.113.10".into(),
+            device_id: "device-test".into(),
+            platform: "Windows".into(),
+            app_version: "1.0.9".into(),
+            user_agent: "Lumora Test".into(),
+            desktop: false,
+        };
         let generated = perform_generation(
             &state,
             &user,
             generation_request(2),
+            &metadata,
             "/api/images/generate",
             None,
             false,
@@ -2062,6 +2317,7 @@ mod tests {
                 mask: None,
                 batch: true,
             },
+            &metadata,
             "/api/images/edit",
             None,
             false,
@@ -2078,6 +2334,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(balances, (6, 0));
+        let logged: (String, String, String, String, String) = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT ip_address, device_id, platform, app_version, user_agent
+                 FROM usage_logs ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            logged,
+            (
+                "203.0.113.10".into(),
+                "device-test".into(),
+                "Windows".into(),
+                "1.0.9".into(),
+                "Lumora Test".into()
+            )
+        );
     }
 
     #[tokio::test]
@@ -2110,6 +2393,7 @@ mod tests {
     #[tokio::test]
     async fn rolls_back_credits_and_files_when_image_transaction_fails() {
         let (_directory, state, user) = test_state(3).await;
+        let metadata = RequestMetadata::default();
         database(&state.db)
             .unwrap()
             .execute_batch(
@@ -2121,6 +2405,7 @@ mod tests {
             &state,
             &user,
             generation_request(1),
+            &metadata,
             "/api/images/generate",
             None,
             false,
@@ -2152,6 +2437,7 @@ mod tests {
             generation: generation_request(1),
             input_files: Vec::new(),
             mask_file: None,
+            request_metadata: RequestMetadata::default(),
         })
         .unwrap();
         database(&state.db)
@@ -2214,6 +2500,7 @@ mod tests {
             generation: generation_request(1),
             input_files: Vec::new(),
             mask_file: None,
+            request_metadata: RequestMetadata::default(),
         })
         .unwrap();
         let connection = database(&state.db).unwrap();
@@ -2290,6 +2577,9 @@ mod tests {
         let (_directory, state, _user) = test_state(1).await;
         let app = Router::new()
             .route("/v1/images/generations", post(external_generate))
+            .layer(Extension(ConnectInfo(
+                "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+            )))
             .with_state(state);
         let response = app
             .oneshot(
@@ -2363,20 +2653,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn localizes_pending_desktop_image_and_removes_temporary_file() {
+        let (_directory, state, user) = test_state(1).await;
+        let now = Utc::now().to_rfc3339();
+        let file_name = "pending.png";
+        std_fs::write(state.config.image_directory.join(file_name), png_bytes()).unwrap();
+        let connection = database(&state.db).unwrap();
+        connection
+            .execute(
+                "INSERT INTO images (
+                   id, user_id, file_name, prompt, size, model, created_at,
+                   visibility, format, category, storage, device_id
+                 ) VALUES ('pending-image', ?1, ?2, 'test', '1024x1024', ?3, ?4,
+                           'public', 'png', 'test', 'pending', 'device-test')",
+                params![user.id, file_name, MODEL, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('local-session', ?1, ?2, '2099-01-01T00:00:00Z')",
+                params![user.id, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let app = Router::new()
+            .route("/api/images/{id}/local", post(localize_image))
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/images/pending-image/local")
+                    .header(header::COOKIE, "lumora_session=local-session")
+                    .header("x-lumora-device-id", "device-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let record: (String, String) = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT storage, visibility FROM images WHERE id = 'pending-image'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(record, ("local".into(), "private".into()));
+        assert!(!state.config.image_directory.join(file_name).exists());
+    }
+
+    #[tokio::test]
     async fn excludes_private_images_from_public_endpoints() {
         let (_directory, state, user) = test_state(1).await;
         let now = Utc::now().to_rfc3339();
         let connection = database(&state.db).unwrap();
-        for (id, visibility) in [("public-image", "public"), ("private-image", "private")] {
+        for (id, visibility, storage) in [
+            ("public-image", "public", "server"),
+            ("local-public-image", "public", "local"),
+            ("private-image", "private", "server"),
+        ] {
             let file_name = format!("{id}.png");
             std_fs::write(state.config.image_directory.join(&file_name), png_bytes()).unwrap();
             connection
                 .execute(
                     "INSERT INTO images (
                        id, user_id, file_name, prompt, size, model, created_at,
-                       visibility, format, category
-                     ) VALUES (?1, ?2, ?3, ?4, '1024x1024', ?5, ?6, ?7, 'png', 'test')",
-                    params![id, user.id, file_name, id, MODEL, now, visibility],
+                       visibility, format, category, storage
+                     ) VALUES (?1, ?2, ?3, ?4, '1024x1024', ?5, ?6, ?7, 'png', 'test', ?8)",
+                    params![id, user.id, file_name, id, MODEL, now, visibility, storage],
                 )
                 .unwrap();
         }

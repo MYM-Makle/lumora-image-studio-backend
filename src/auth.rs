@@ -10,7 +10,7 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use rand_core::OsRng;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -28,17 +28,36 @@ pub fn user_from_headers(headers: &HeaderMap, state: &AppState) -> AppResult<Use
     let token = cookie_value(headers, SESSION_COOKIE)
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "请先登录".into()))?;
     let now = Utc::now().to_rfc3339();
-    database(&state.db)?
+    let connection = database(&state.db)?;
+    let user = connection
         .query_row(
             "SELECT u.id, u.name, u.email, u.avatar, u.plan, u.credits, u.credits_reserved
              FROM users u JOIN sessions s ON s.user_id = u.id
-             WHERE s.token = ?1 AND (s.expires_at IS NULL OR s.expires_at > ?2)",
+             WHERE s.token = ?1 AND u.status = 'active'
+               AND (s.expires_at IS NULL OR s.expires_at > ?2)",
             params![token, now],
             user_from_row,
         )
         .optional()
         .map_err(internal_error)?
-        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "登录状态已失效".into()))
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "登录状态已失效".into()))?;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    connection
+        .execute(
+            "UPDATE users SET last_seen_at = ?1 WHERE id = ?2",
+            params![now, user.id],
+        )
+        .map_err(internal_error)?;
+    connection
+        .execute(
+            "INSERT INTO activity_days (user_id, activity_date, last_seen_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id, activity_date)
+             DO UPDATE SET last_seen_at = excluded.last_seen_at",
+            params![user.id, today, now],
+        )
+        .map_err(internal_error)?;
+    Ok(user)
 }
 
 pub fn user_from_api_key(
@@ -59,7 +78,7 @@ pub fn user_from_api_key(
             "SELECT u.id, u.name, u.email, u.avatar, u.plan, u.credits,
                     u.credits_reserved, k.scope
              FROM users u JOIN api_keys k ON k.user_id = u.id
-             WHERE k.status = 'active' AND (
+             WHERE u.status = 'active' AND k.status = 'active' AND (
                (k.is_legacy = 0 AND k.key_hash = ?1) OR
                (k.is_legacy = 1 AND k.key_value = ?2)
              )",
@@ -184,14 +203,43 @@ pub async fn register(
         .next()
         .unwrap_or("Lumora 创作者")
         .to_owned();
-    let connection = database(&state.db)?;
-    connection
+    let now = Utc::now().to_rfc3339();
+    let mut connection = database(&state.db)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(internal_error)?;
+    let is_admin = transaction
+        .query_row("SELECT COUNT(*) = 0 FROM users", [], |row| {
+            row.get::<_, bool>(0)
+        })
+        .map_err(internal_error)?;
+    let (registration_credits, default_daily_limit) = transaction
+        .query_row(
+            "SELECT
+               (SELECT value FROM system_settings WHERE key = 'registration_credits'),
+               (SELECT value FROM system_settings WHERE key = 'default_daily_limit')",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(internal_error)?;
+    transaction
         .execute(
             "INSERT INTO users (
                id, name, email, password_hash, avatar, plan, credits,
-               credits_reserved, daily_limit, created_at
-             ) VALUES (?1, ?2, ?3, ?4, '', 'Free', 3000, 0, 10000, ?5)",
-            params![id, name, email, password_hash, Utc::now().to_rfc3339()],
+               credits_reserved, daily_limit, status, is_admin,
+               last_login_at, last_seen_at, created_at
+             ) VALUES (?1, ?2, ?3, ?4, '', 'Free', ?5, 0, ?6,
+                       'active', ?7, ?8, ?8, ?8)",
+            params![
+                id,
+                name,
+                email,
+                password_hash,
+                registration_credits,
+                default_daily_limit,
+                is_admin,
+                now
+            ],
         )
         .map_err(|error| {
             if error.to_string().contains("UNIQUE") {
@@ -200,6 +248,28 @@ pub async fn register(
                 internal_error(error)
             }
         })?;
+    transaction
+        .execute(
+            "INSERT INTO credit_ledger (
+               id, user_id, delta, balance_after, reason, reference_id, created_at
+             ) VALUES (?1, ?2, ?3, ?3, 'registration_grant', ?4, ?5)",
+            params![
+                format!("credit-{}", Uuid::new_v4().simple()),
+                id,
+                registration_credits,
+                format!("registration:{id}"),
+                now
+            ],
+        )
+        .map_err(internal_error)?;
+    transaction
+        .execute(
+            "INSERT INTO activity_days (user_id, activity_date, last_seen_at)
+             VALUES (?1, ?2, ?3)",
+            params![id, Utc::now().format("%Y-%m-%d").to_string(), now],
+        )
+        .map_err(internal_error)?;
+    transaction.commit().map_err(internal_error)?;
     drop(connection);
     let token = create_session(&state, &id)?;
     let user = UserResponse {
@@ -208,7 +278,7 @@ pub async fn register(
         email,
         avatar: String::new(),
         plan: "Free".into(),
-        credits: 3000,
+        credits: registration_credits,
         credits_reserved: 0,
     };
     Ok((
@@ -230,7 +300,7 @@ pub async fn login(
     let (email, password) = validate_auth(&request)?;
     let result = database(&state.db)?
         .query_row(
-            "SELECT id, name, email, password_hash, avatar, plan, credits, credits_reserved
+            "SELECT id, name, email, password_hash, avatar, plan, credits, credits_reserved, status
              FROM users WHERE email = ?1",
             [email],
             |row| {
@@ -243,17 +313,39 @@ pub async fn login(
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )
         .optional()
         .map_err(internal_error)?
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "邮箱或密码错误".into()))?;
+    if result.8 != "active" {
+        return Err(AppError(StatusCode::FORBIDDEN, "账号已停用".into()));
+    }
     let parsed_hash = PasswordHash::new(&result.3)
         .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "密码数据无效".into()))?;
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)
         .map_err(|_| AppError(StatusCode::UNAUTHORIZED, "邮箱或密码错误".into()))?;
+    let now = Utc::now().to_rfc3339();
+    let connection = database(&state.db)?;
+    connection
+        .execute(
+            "UPDATE users SET last_login_at = ?1, last_seen_at = ?1 WHERE id = ?2",
+            params![now, result.0],
+        )
+        .map_err(internal_error)?;
+    connection
+        .execute(
+            "INSERT INTO activity_days (user_id, activity_date, last_seen_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id, activity_date)
+             DO UPDATE SET last_seen_at = excluded.last_seen_at",
+            params![result.0, Utc::now().format("%Y-%m-%d").to_string(), now],
+        )
+        .map_err(internal_error)?;
+    drop(connection);
     let token = create_session(&state, &result.0)?;
     let user = UserResponse {
         id: result.0,
@@ -541,5 +633,40 @@ mod tests {
         assert_ne!(stored.0, created.data.secret);
         assert_eq!(stored.1, hash_api_key(&created.data.secret));
         assert_eq!(stored.2, 0);
+    }
+
+    #[tokio::test]
+    async fn applies_registration_defaults_from_system_settings() {
+        let (_directory, state) = test_state();
+        database(&state.db)
+            .unwrap()
+            .execute_batch(
+                "UPDATE system_settings SET value = 5200 WHERE key = 'registration_credits';
+                 UPDATE system_settings SET value = 240 WHERE key = 'default_daily_limit';",
+            )
+            .unwrap();
+
+        let response = register(
+            State(state.clone()),
+            Ok(Json(AuthRequest {
+                email: "new-user@example.test".into(),
+                password: "StrongPass123!".into(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let values: (i64, i64, i64) = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT u.credits, u.daily_limit, l.delta
+                 FROM users u JOIN credit_ledger l ON l.user_id = u.id
+                 WHERE u.email = 'new-user@example.test'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (5200, 240, 5200));
     }
 }

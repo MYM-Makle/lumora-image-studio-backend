@@ -145,6 +145,7 @@ pub struct ImageResponse {
     pub format: String,
     pub is_public: bool,
     pub category: String,
+    pub storage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
 }

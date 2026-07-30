@@ -6,6 +6,7 @@ use axum::{
 use chrono::Utc;
 use reqwest::Url;
 use rusqlite::{params, OptionalExtension};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -37,7 +38,10 @@ pub async fn health(
     let provider_configured = if let Some(user) = &user {
         database(&state.db)?
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM providers WHERE user_id = ?1 AND is_active = 1)",
+                "SELECT EXISTS(
+                   SELECT 1 FROM providers
+                   WHERE (user_id = ?1 OR is_global = 1) AND is_active = 1
+                 )",
                 [&user.id],
                 |row| row.get::<_, bool>(0),
             )
@@ -51,6 +55,50 @@ pub async fn health(
         "providerConfigured": provider_configured,
         "model": MODEL
     }))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatRequest {
+    device_id: String,
+    platform: String,
+    app_version: String,
+}
+
+pub async fn heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<HeartbeatRequest>, JsonRejection>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let request = api_json(payload)?;
+    let user = user_from_headers(&headers, &state)?;
+    let device_id = request.device_id.trim();
+    let platform = request.platform.trim();
+    let app_version = request.app_version.trim();
+    if device_id.is_empty()
+        || device_id.len() > 128
+        || platform.is_empty()
+        || platform.len() > 64
+        || app_version.is_empty()
+        || app_version.len() > 32
+    {
+        return Err(AppError(StatusCode::BAD_REQUEST, "设备信息无效".into()));
+    }
+    let now = Utc::now().to_rfc3339();
+    database(&state.db)?
+        .execute(
+            "INSERT INTO devices (
+               id, user_id, platform, app_version, first_seen_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               user_id = excluded.user_id,
+               platform = excluded.platform,
+               app_version = excluded.app_version,
+               last_seen_at = excluded.last_seen_at",
+            params![device_id, user.id, platform, app_version, now],
+        )
+        .map_err(internal_error)?;
+    Ok(Json(api_success(Value::Null)))
 }
 
 pub async fn public_config(State(state): State<AppState>) -> Json<ApiResponse<Value>> {
@@ -72,7 +120,8 @@ pub async fn public_stats(State(state): State<AppState>) -> AppResult<Json<ApiRe
         .map_err(internal_error)?;
     let public_images: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM images WHERE visibility = 'public'",
+            "SELECT COUNT(*) FROM images
+             WHERE visibility = 'public' AND storage = 'server'",
             [],
             |row| row.get(0),
         )
@@ -80,7 +129,7 @@ pub async fn public_stats(State(state): State<AppState>) -> AppResult<Json<ApiRe
     let mut statement = connection
         .prepare(
             "SELECT category, COUNT(*) FROM images
-             WHERE visibility = 'public'
+             WHERE visibility = 'public' AND storage = 'server'
              GROUP BY category ORDER BY COUNT(*) DESC",
         )
         .map_err(internal_error)?;
@@ -301,7 +350,9 @@ pub fn active_provider(state: &AppState, user_id: &str) -> AppResult<ProviderCon
     let row = database(&state.db)?
         .query_row(
             "SELECT id, base_url, api_key, api_key_cipher, encryption_version, model
-             FROM providers WHERE user_id = ?1 AND is_active = 1",
+             FROM providers
+             WHERE (user_id = ?1 OR is_global = 1) AND is_active = 1
+             ORDER BY is_global ASC LIMIT 1",
             [user_id],
             |row| {
                 Ok((
@@ -417,7 +468,7 @@ fn usage_for_user(state: &AppState, user_id: &str) -> AppResult<UsageResponse> {
     })
 }
 
-fn normalize_base_url(value: &str) -> AppResult<String> {
+pub(crate) fn normalize_base_url(value: &str) -> AppResult<String> {
     let trimmed = value.trim().trim_end_matches('/');
     let url = Url::parse(trimmed)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Base URL 无效".into()))?;

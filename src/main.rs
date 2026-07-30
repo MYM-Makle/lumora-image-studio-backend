@@ -1,4 +1,5 @@
 mod account;
+mod admin;
 mod auth;
 mod config;
 mod db;
@@ -6,7 +7,7 @@ mod images;
 mod model;
 mod security;
 
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -55,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     images::recover_tasks(&state)?;
 
     let static_service = ServeDir::new(&config.static_directory)
-        .not_found_service(ServeFile::new(config.static_directory.join("index.html")));
+        .fallback(ServeFile::new(config.static_directory.join("index.html")));
     let app = Router::new()
         .route("/healthz", get(account::liveness))
         .route("/api/health", get(account::health))
@@ -66,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
+        .route("/api/activity/heartbeat", post(account::heartbeat))
         .route("/api/announcements", get(account::list_announcements))
         .route(
             "/api/api-keys",
@@ -97,12 +99,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/images/{id}/visibility",
             put(images::update_image_visibility),
         )
+        .route("/api/images/{id}/local", post(images::localize_image))
         .route("/api/images/{id}", delete(images::delete_image))
         .route("/api/images/{id}/file", get(images::private_image_file))
         .route("/api/image-tasks", get(images::list_active_image_tasks))
         .route("/api/image-tasks/{ids}", get(images::get_image_tasks))
         .route("/api/gallery", get(images::public_gallery))
         .route("/public/images/{id}", get(images::public_image_file))
+        .route("/api/admin/session", get(admin::session))
+        .route("/api/admin/overview", get(admin::overview))
+        .route("/api/admin/users", get(admin::list_users))
+        .route("/api/admin/users/{id}", put(admin::update_user))
+        .route("/api/admin/users/{id}/credits", post(admin::adjust_credits))
+        .route("/api/admin/credit-ledger", get(admin::list_credit_ledger))
+        .route("/api/admin/usage-logs", get(admin::list_usage_logs))
+        .route(
+            "/api/admin/settings",
+            get(admin::get_settings).put(admin::update_settings),
+        )
+        .route(
+            "/api/admin/providers",
+            get(admin::list_providers).post(admin::create_provider),
+        )
+        .route(
+            "/api/admin/providers/{id}/activate",
+            put(admin::activate_provider),
+        )
+        .route("/api/admin/providers/{id}", delete(admin::delete_provider))
+        .route("/api/admin/announcements", post(admin::create_announcement))
+        .route(
+            "/api/admin/announcements/{id}",
+            put(admin::update_announcement).delete(admin::delete_announcement),
+        )
         .route("/v1/images/generations", post(images::external_generate))
         .route("/v1/images/edits", post(images::external_edit))
         .route(
@@ -122,9 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(address = %config.bind, "Lumora API started");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 

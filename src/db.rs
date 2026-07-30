@@ -14,7 +14,7 @@ use crate::{
 use axum::http::StatusCode;
 
 pub type Database = Arc<Mutex<Connection>>;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 5;
 
 pub fn open_database(
     data_directory: &Path,
@@ -128,10 +128,54 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
            updated_at TEXT NOT NULL,
            confirmed_at TEXT
          );
+         CREATE TABLE IF NOT EXISTS devices (
+           id TEXT PRIMARY KEY,
+           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+           platform TEXT NOT NULL,
+           app_version TEXT NOT NULL,
+           first_seen_at TEXT NOT NULL,
+           last_seen_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS activity_days (
+           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+           activity_date TEXT NOT NULL,
+           last_seen_at TEXT NOT NULL,
+           PRIMARY KEY (user_id, activity_date)
+         );
+         CREATE TABLE IF NOT EXISTS credit_ledger (
+           id TEXT PRIMARY KEY,
+           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+           delta INTEGER NOT NULL,
+           balance_after INTEGER NOT NULL,
+           reason TEXT NOT NULL,
+           reference_id TEXT NOT NULL UNIQUE,
+           operator_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS admin_audit_logs (
+           id TEXT PRIMARY KEY,
+           admin_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+           action TEXT NOT NULL,
+           target_type TEXT NOT NULL,
+           target_id TEXT NOT NULL,
+           detail TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS system_settings (
+           key TEXT PRIMARY KEY,
+           value INTEGER NOT NULL,
+           updated_at TEXT NOT NULL
+         );
          CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
          CREATE INDEX IF NOT EXISTS idx_images_user_created ON images(user_id, created_at DESC);
          CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_logs(user_id, created_at DESC);
-         CREATE INDEX IF NOT EXISTS idx_tasks_user_created ON tasks(user_id, created_at DESC);",
+         CREATE INDEX IF NOT EXISTS idx_tasks_user_created ON tasks(user_id, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_devices_user_seen ON devices(user_id, last_seen_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_activity_date ON activity_days(activity_date);
+         CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_created
+           ON credit_ledger(user_id, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_admin_audit_created
+           ON admin_audit_logs(created_at DESC);",
     )?;
 
     add_column(
@@ -146,6 +190,20 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
         "daily_limit",
         "INTEGER NOT NULL DEFAULT 10000",
     )?;
+    add_column(
+        connection,
+        "users",
+        "status",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
+    add_column(
+        connection,
+        "users",
+        "is_admin",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column(connection, "users", "last_login_at", "TEXT")?;
+    add_column(connection, "users", "last_seen_at", "TEXT")?;
     add_column(connection, "sessions", "expires_at", "TEXT")?;
     add_column(connection, "api_keys", "key_hash", "TEXT")?;
     add_column(connection, "api_keys", "key_prefix", "TEXT")?;
@@ -167,6 +225,12 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
     )?;
     add_column(
         connection,
+        "providers",
+        "is_global",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column(
+        connection,
         "images",
         "visibility",
         "TEXT NOT NULL DEFAULT 'private'",
@@ -183,12 +247,68 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
         "category",
         "TEXT NOT NULL DEFAULT '其他'",
     )?;
+    add_column(
+        connection,
+        "images",
+        "storage",
+        "TEXT NOT NULL DEFAULT 'server'",
+    )?;
+    add_column(
+        connection,
+        "images",
+        "device_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column(
+        connection,
+        "usage_logs",
+        "ip_address",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column(
+        connection,
+        "usage_logs",
+        "device_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column(
+        connection,
+        "usage_logs",
+        "platform",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column(
+        connection,
+        "usage_logs",
+        "app_version",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column(
+        connection,
+        "usage_logs",
+        "user_agent",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     connection.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_images_public_created
-         ON images(visibility, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_images_public_storage_created
+         ON images(visibility, storage, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_usage_created
+           ON usage_logs(created_at DESC);
+         INSERT OR IGNORE INTO system_settings (key, value, updated_at)
+           VALUES ('registration_credits', 3000, CURRENT_TIMESTAMP);
+         INSERT OR IGNORE INTO system_settings (key, value, updated_at)
+           VALUES ('default_daily_limit', 10000, CURRENT_TIMESTAMP);
+         INSERT OR IGNORE INTO credit_ledger (
+           id, user_id, delta, balance_after, reason, reference_id, created_at
+         )
+         SELECT 'opening-' || id, id, credits, credits, 'opening_balance',
+                'opening:' || id, created_at
+         FROM users
+         WHERE NOT EXISTS (
+           SELECT 1 FROM credit_ledger WHERE credit_ledger.user_id = users.id
+         );",
     )?;
 
-    seed_announcements(connection)?;
     Ok(())
 }
 
@@ -240,38 +360,6 @@ fn add_column(
         connection.execute_batch(&format!(
             "ALTER TABLE {table} ADD COLUMN {column} {definition}"
         ))?;
-    }
-    Ok(())
-}
-
-fn seed_announcements(connection: &Connection) -> rusqlite::Result<()> {
-    let count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM announcements", [], |row| row.get(0))?;
-    if count > 0 {
-        return Ok(());
-    }
-    let items = [
-        (
-            "ann-1",
-            "Lumora 本地服务上线",
-            "图片记录、调用方配置和生成结果现已由本地服务持久化。",
-            "2026-07-27",
-            "feature",
-        ),
-        (
-            "ann-2",
-            "GPT-IMAGE-2 生图接口",
-            "支持尺寸、质量、多图编辑与异步任务。",
-            "2026-07-27",
-            "update",
-        ),
-    ];
-    for item in items {
-        connection.execute(
-            "INSERT INTO announcements (id, title, content, date, type, is_new)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-            params![item.0, item.1, item.2, item.3, item.4],
-        )?;
     }
     Ok(())
 }
@@ -367,5 +455,43 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(backups.len(), 1);
+    }
+
+    #[test]
+    fn does_not_duplicate_registration_credits_on_restart() {
+        let directory = tempdir().unwrap();
+        let master_key = [9_u8; 32];
+        let db = open_database(directory.path(), &master_key).unwrap();
+        db.lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO users (
+                   id, name, email, password_hash, avatar, plan, credits, created_at
+                 ) VALUES (
+                   'registered-user', 'Registered', 'registered@example.test',
+                   'hash', '', 'Free', 3000, '2026-01-01T00:00:00Z'
+                 );
+                 INSERT INTO credit_ledger (
+                   id, user_id, delta, balance_after, reason, reference_id, created_at
+                 ) VALUES (
+                   'registration-credit', 'registered-user', 3000, 3000,
+                   'registration_grant', 'registration:registered-user',
+                   '2026-01-01T00:00:00Z'
+                 );",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = open_database(directory.path(), &master_key).unwrap();
+        let count = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_ledger WHERE user_id = 'registered-user'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
