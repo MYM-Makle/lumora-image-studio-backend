@@ -11,12 +11,14 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     extract::DefaultBodyLimit,
+    http::{header, HeaderName, HeaderValue, Method},
     routing::{any, delete, get, post, put},
     Router,
 };
 use reqwest::Client;
 use tokio::sync::Semaphore;
 use tower_http::{
+    cors::CorsLayer,
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
@@ -57,6 +59,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let static_service = ServeDir::new(&config.static_directory)
         .fallback(ServeFile::new(config.static_directory.join("index.html")));
+    let cors = CorsLayer::new()
+        .allow_origin([
+            HeaderValue::from_static("https://tauri.localhost"),
+            HeaderValue::from_static("http://tauri.localhost"),
+            HeaderValue::from_static("tauri://localhost"),
+        ])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-lumora-device-id"),
+            HeaderName::from_static("x-lumora-platform"),
+            HeaderName::from_static("x-lumora-app-version"),
+            HeaderName::from_static("x-lumora-client"),
+        ])
+        .allow_credentials(true);
     let app = Router::new()
         .route("/healthz", get(account::liveness))
         .route("/api/health", get(account::health))
@@ -64,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/stats", get(account::public_stats))
         .route("/api/session", get(auth::session))
         .route("/api/account/profile", put(account::update_profile))
+        .route("/api/auth/email-code", post(auth::send_email_code))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -99,6 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/images/{id}/visibility",
             put(images::update_image_visibility),
         )
+        .route(
+            "/api/images/{id}/publish",
+            post(images::publish_local_image),
+        )
         .route("/api/images/{id}/local", post(images::localize_image))
         .route("/api/images/{id}", delete(images::delete_image))
         .route("/api/images/{id}/file", get(images::private_image_file))
@@ -121,6 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/admin/users/{id}/credits", post(admin::adjust_credits))
         .route("/api/admin/credit-ledger", get(admin::list_credit_ledger))
         .route("/api/admin/usage-logs", get(admin::list_usage_logs))
+        .route("/api/admin/ip-location", get(admin::ip_location))
+        .route("/api/admin/images/{id}/file", get(admin::image_file))
         .route(
             "/api/admin/settings",
             get(admin::get_settings).put(admin::update_settings),
@@ -154,6 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback_service(static_service)
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
+        .layer(cors)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;

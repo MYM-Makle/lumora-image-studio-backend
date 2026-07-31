@@ -9,7 +9,7 @@ use axum::{
     Json,
 };
 use chrono::{Duration, Utc};
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -18,11 +18,16 @@ use crate::{
     db::{database, internal_error},
     model::{
         api_json, api_success, ApiKeyItemResponse, ApiPrincipal, ApiResponse, AppError, AppResult,
-        AuthRequest, CreateApiKeyRequest, CreatedApiKeyResponse, UserResponse, SESSION_COOKIE,
+        AuthRequest, CreateApiKeyRequest, CreatedApiKeyResponse, EmailCodeRequest, UserResponse,
+        SESSION_COOKIE,
     },
     security::{hash_api_key, key_parts, mask_key},
     AppState,
 };
+
+const EMAIL_CODE_TTL_MINUTES: i64 = 10;
+const EMAIL_CODE_COOLDOWN_SECONDS: i64 = 60;
+const EMAIL_CODE_MAX_ATTEMPTS: i64 = 5;
 
 pub fn user_from_headers(headers: &HeaderMap, state: &AppState) -> AppResult<UserResponse> {
     let token = cookie_value(headers, SESSION_COOKIE)
@@ -133,10 +138,7 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn validate_auth(request: &AuthRequest) -> AppResult<(String, String)> {
-    let email = request.email.trim().to_lowercase();
-    if email.len() > 254 || !email.contains('@') {
-        return Err(AppError(StatusCode::BAD_REQUEST, "邮箱格式无效".into()));
-    }
+    let email = normalize_email(&request.email)?;
     if request.password.len() < 8 || request.password.len() > 128 {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
@@ -144,6 +146,58 @@ fn validate_auth(request: &AuthRequest) -> AppResult<(String, String)> {
         ));
     }
     Ok((email, request.password.clone()))
+}
+
+fn normalize_email(value: &str) -> AppResult<String> {
+    let email = value.trim().to_lowercase();
+    if email.is_empty() || email.len() > 254 || !email.contains('@') {
+        return Err(AppError(StatusCode::BAD_REQUEST, "邮箱格式无效".into()));
+    }
+    Ok(email)
+}
+
+fn hash_verification_code(code: &str) -> AppResult<String> {
+    Argon2::default()
+        .hash_password(code.as_bytes(), &SaltString::generate(&mut OsRng))
+        .map(|hash| hash.to_string())
+        .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "验证码处理失败".into()))
+}
+
+async fn deliver_verification_code(state: &AppState, email: &str, code: &str) -> AppResult<()> {
+    let api_key = std::env::var("LUMORA_RESEND_API_KEY")
+        .map_err(|_| AppError(StatusCode::SERVICE_UNAVAILABLE, "邮件服务未配置".into()))?;
+    let from = std::env::var("LUMORA_EMAIL_FROM")
+        .map_err(|_| AppError(StatusCode::SERVICE_UNAVAILABLE, "邮件服务未配置".into()))?;
+    let response = state
+        .client
+        .post("https://api.resend.com/emails")
+        .timeout(std::time::Duration::from_secs(10))
+        .bearer_auth(api_key)
+        .json(&json!({
+            "from": from,
+            "to": [email],
+            "subject": "Lumora 邮箱验证码",
+            "html": format!(
+                "<p>您好！</p><p>注册验证码：<strong style=\"font-size:28px;letter-spacing:6px\">{code}</strong>。</p><p>转给他人将导致 <strong>Lumora</strong> 账号被盗和个人信息泄露，谨防诈骗。如非您本人操作，请忽略此邮件。</p><p>此致<br><strong>Lumora</strong></p>"
+            ),
+            "text": format!(
+                "您好！\n\n注册验证码：{code}。转给他人将导致 Lumora 账号被盗和个人信息泄露，谨防诈骗。如非您本人操作，请忽略此邮件。\n\n此致\nLumora"
+            )
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "verification email request failed");
+            AppError(StatusCode::BAD_GATEWAY, "验证码邮件发送失败".into())
+        })?;
+    if !response.status().is_success() {
+        tracing::error!(status = %response.status(), "verification email rejected");
+        return Err(AppError(
+            StatusCode::BAD_GATEWAY,
+            "验证码邮件发送失败".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn create_session(state: &AppState, user_id: &str) -> AppResult<String> {
@@ -172,12 +226,12 @@ fn create_session(state: &AppState, user_id: &str) -> AppResult<String> {
 }
 
 fn session_cookie(state: &AppState, token: &str, max_age: i64) -> String {
-    let secure = if state.config.production {
-        "; Secure"
+    let (same_site, secure) = if state.config.production {
+        ("None", "; Secure")
     } else {
-        ""
+        ("Lax", "")
     };
-    format!("{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age={max_age}{secure}")
+    format!("{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite={same_site}; Max-Age={max_age}{secure}")
 }
 
 pub async fn session(
@@ -187,12 +241,92 @@ pub async fn session(
     Json(api_success(user_from_headers(&headers, &state).ok()))
 }
 
+pub async fn send_email_code(
+    State(state): State<AppState>,
+    payload: Result<Json<EmailCodeRequest>, JsonRejection>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let request = api_json(payload)?;
+    let email = normalize_email(&request.email)?;
+    let code = format!("{:06}", OsRng.next_u32() % 1_000_000);
+    let code_hash = hash_verification_code(&code)?;
+    let now = Utc::now();
+    {
+        let mut connection = database(&state.db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let already_registered = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE email = ?1)",
+                [&email],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(internal_error)?;
+        if already_registered {
+            return Err(AppError(StatusCode::CONFLICT, "该邮箱已注册".into()));
+        }
+        let last_sent_at = transaction
+            .query_row(
+                "SELECT last_sent_at FROM email_verifications WHERE email = ?1",
+                [&email],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal_error)?;
+        if last_sent_at
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            .is_some_and(|sent_at| {
+                now.signed_duration_since(sent_at) < Duration::seconds(EMAIL_CODE_COOLDOWN_SECONDS)
+            })
+        {
+            return Err(AppError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "验证码发送过于频繁，请稍后再试".into(),
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO email_verifications (email, code_hash, expires_at, last_sent_at, attempts)
+                 VALUES (?1, ?2, ?3, ?4, 0)
+                 ON CONFLICT(email) DO UPDATE SET
+                   code_hash = excluded.code_hash,
+                   expires_at = excluded.expires_at,
+                   last_sent_at = excluded.last_sent_at,
+                   attempts = 0",
+                params![
+                    email,
+                    code_hash,
+                    (now + Duration::minutes(EMAIL_CODE_TTL_MINUTES)).to_rfc3339(),
+                    now.to_rfc3339()
+                ],
+            )
+            .map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+    }
+
+    if let Err(error) = deliver_verification_code(&state, &email, &code).await {
+        database(&state.db)?
+            .execute(
+                "DELETE FROM email_verifications WHERE email = ?1 AND code_hash = ?2",
+                params![email, code_hash],
+            )
+            .map_err(internal_error)?;
+        return Err(error);
+    }
+    Ok(Json(api_success(Value::Null)))
+}
+
 pub async fn register(
     State(state): State<AppState>,
     payload: Result<Json<AuthRequest>, JsonRejection>,
 ) -> AppResult<Response> {
     let request = api_json(payload)?;
     let (email, password) = validate_auth(&request)?;
+    let verification_code = request
+        .verification_code
+        .as_deref()
+        .filter(|code| code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "请输入 6 位邮箱验证码".into()))?;
     let password_hash = Argon2::default()
         .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
         .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "密码处理失败".into()))?
@@ -208,6 +342,52 @@ pub async fn register(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(internal_error)?;
+    let verification = transaction
+        .query_row(
+            "SELECT code_hash, expires_at, attempts
+             FROM email_verifications WHERE email = ?1",
+            [&email],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "请先获取邮箱验证码".into()))?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&verification.1)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "邮箱验证码已失效".into()))?;
+    if expires_at <= Utc::now() {
+        transaction
+            .execute("DELETE FROM email_verifications WHERE email = ?1", [&email])
+            .map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        return Err(AppError(StatusCode::BAD_REQUEST, "邮箱验证码已过期".into()));
+    }
+    if verification.2 >= EMAIL_CODE_MAX_ATTEMPTS {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "验证码错误次数过多，请重新获取".into(),
+        ));
+    }
+    let valid_code = PasswordHash::new(&verification.0).ok().is_some_and(|hash| {
+        Argon2::default()
+            .verify_password(verification_code.as_bytes(), &hash)
+            .is_ok()
+    });
+    if !valid_code {
+        transaction
+            .execute(
+                "UPDATE email_verifications SET attempts = attempts + 1 WHERE email = ?1",
+                [&email],
+            )
+            .map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        return Err(AppError(StatusCode::BAD_REQUEST, "邮箱验证码错误".into()));
+    }
     let is_admin = transaction
         .query_row("SELECT COUNT(*) = 0 FROM users", [], |row| {
             row.get::<_, bool>(0)
@@ -268,6 +448,9 @@ pub async fn register(
              VALUES (?1, ?2, ?3)",
             params![id, Utc::now().format("%Y-%m-%d").to_string(), now],
         )
+        .map_err(internal_error)?;
+    transaction
+        .execute("DELETE FROM email_verifications WHERE email = ?1", [&email])
         .map_err(internal_error)?;
     transaction.commit().map_err(internal_error)?;
     drop(connection);
@@ -534,6 +717,22 @@ mod tests {
         (directory, state)
     }
 
+    fn insert_verification(state: &AppState, email: &str, code: &str) {
+        database(&state.db)
+            .unwrap()
+            .execute(
+                "INSERT INTO email_verifications (email, code_hash, expires_at, last_sent_at, attempts)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![
+                    email,
+                    hash_verification_code(code).unwrap(),
+                    (Utc::now() + Duration::minutes(10)).to_rfc3339(),
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn enforces_key_scopes_and_accepts_legacy_keys() {
         let (_directory, state) = test_state();
@@ -575,6 +774,18 @@ mod tests {
             HeaderValue::from_static("Bearer legacy-key"),
         );
         assert!(user_from_api_key(&headers, &state, &["full"]).is_ok());
+    }
+
+    #[test]
+    fn uses_cross_site_session_cookie_in_production() {
+        let (_directory, mut state) = test_state();
+        assert!(session_cookie(&state, "token", 60).contains("SameSite=Lax"));
+        assert!(!session_cookie(&state, "token", 60).contains("; Secure"));
+
+        state.config.production = true;
+        let cookie = session_cookie(&state, "token", 60);
+        assert!(cookie.contains("SameSite=None"));
+        assert!(cookie.contains("; Secure"));
     }
 
     #[tokio::test]
@@ -636,8 +847,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_invalid_registration_code_and_counts_attempts() {
+        let (_directory, state) = test_state();
+        insert_verification(&state, "new-user@example.test", "123456");
+
+        let error = match register(
+            State(state.clone()),
+            Ok(Json(AuthRequest {
+                email: "new-user@example.test".into(),
+                password: "StrongPass123!".into(),
+                verification_code: Some("654321".into()),
+            })),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("invalid verification code unexpectedly accepted"),
+        };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        let attempts = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT attempts FROM email_verifications WHERE email = 'new-user@example.test'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
     async fn applies_registration_defaults_from_system_settings() {
         let (_directory, state) = test_state();
+        insert_verification(&state, "new-user@example.test", "123456");
         database(&state.db)
             .unwrap()
             .execute_batch(
@@ -651,6 +894,7 @@ mod tests {
             Ok(Json(AuthRequest {
                 email: "new-user@example.test".into(),
                 password: "StrongPass123!".into(),
+                verification_code: Some("123456".into()),
             })),
         )
         .await
@@ -668,5 +912,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(values, (5200, 240, 5200));
+        let remaining = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM email_verifications WHERE email = 'new-user@example.test'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

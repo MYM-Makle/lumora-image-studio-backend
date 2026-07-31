@@ -120,8 +120,7 @@ pub async fn public_stats(State(state): State<AppState>) -> AppResult<Json<ApiRe
         .map_err(internal_error)?;
     let public_images: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM images
-             WHERE visibility = 'public' AND storage = 'server'",
+            "SELECT COUNT(*) FROM images WHERE visibility = 'public'",
             [],
             |row| row.get(0),
         )
@@ -129,7 +128,7 @@ pub async fn public_stats(State(state): State<AppState>) -> AppResult<Json<ApiRe
     let mut statement = connection
         .prepare(
             "SELECT category, COUNT(*) FROM images
-             WHERE visibility = 'public' AND storage = 'server'
+             WHERE visibility = 'public'
              GROUP BY category ORDER BY COUNT(*) DESC",
         )
         .map_err(internal_error)?;

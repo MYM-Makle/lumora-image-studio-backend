@@ -175,18 +175,30 @@ pub async fn update_image_visibility(
     }))))
 }
 
-pub async fn localize_image(
+pub async fn publish_local_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
+    mut multipart: Multipart,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let user = user_from_headers(&headers, &state)?;
-    let device_id = header_text(&headers, "x-lumora-device-id", 128)
-        .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "设备 ID 缺失".into()))?;
+    let mut image = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "图片上传参数无效".into()))?
+    {
+        if field.name() == Some("image") {
+            if image.is_some() {
+                return Err(AppError(StatusCode::BAD_REQUEST, "只能上传一张图片".into()));
+            }
+            image = Some(input_from_field(field).await?);
+        }
+    }
+    let image = image.ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "图片文件缺失".into()))?;
     let record = database(&state.db)?
         .query_row(
-            "SELECT file_name, storage, device_id
-             FROM images WHERE id = ?1 AND user_id = ?2",
+            "SELECT file_name, format, storage FROM images WHERE id = ?1 AND user_id = ?2",
             params![id, user.id],
             |row| {
                 Ok((
@@ -199,14 +211,67 @@ pub async fn localize_image(
         .optional()
         .map_err(internal_error)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
+    if record.2 != "local" {
+        return Err(AppError(StatusCode::CONFLICT, "该图片不是本地图片".into()));
+    }
+    let detected_format = detect_image_format(&image.bytes).map(|item| item.0);
+    if detected_format != Some(record.1.as_str()) {
+        return Err(AppError(StatusCode::BAD_REQUEST, "图片格式不匹配".into()));
+    }
+    fs::write(state.config.image_directory.join(record.0), image.bytes)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, image_id = id, "server image backup failed");
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "服务器图片保存失败".into(),
+            )
+        })?;
+    let updated = database(&state.db)?
+        .execute(
+            "UPDATE images SET visibility = 'public'
+             WHERE id = ?1 AND user_id = ?2 AND storage = 'local'",
+            params![id, user.id],
+        )
+        .map_err(internal_error)?;
+    if updated == 0 {
+        return Err(AppError(StatusCode::NOT_FOUND, "图片不存在".into()));
+    }
+    Ok(Json(api_success(json!({ "id": id, "isPublic": true }))))
+}
+
+pub async fn localize_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let user = user_from_headers(&headers, &state)?;
+    let device_id = header_text(&headers, "x-lumora-device-id", 128)
+        .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "设备 ID 缺失".into()))?;
+    let record = database(&state.db)?
+        .query_row(
+            "SELECT file_name, storage, device_id, visibility
+             FROM images WHERE id = ?1 AND user_id = ?2",
+            params![id, user.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
     if record.2 != device_id {
         return Err(AppError(StatusCode::CONFLICT, "图片不属于当前设备".into()));
     }
     if record.1 == "pending" {
         database(&state.db)?
             .execute(
-                "UPDATE images
-                 SET storage = 'local', visibility = 'private'
+                "UPDATE images SET storage = 'local'
                  WHERE id = ?1 AND user_id = ?2 AND storage = 'pending' AND device_id = ?3",
                 params![id, user.id, device_id],
             )
@@ -217,15 +282,10 @@ pub async fn localize_image(
             "该图片不是桌面端待转存图片".into(),
         ));
     }
-    if let Err(error) = fs::remove_file(state.config.image_directory.join(record.0)).await {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::error!(error = %error, image_id = id, "temporary image cleanup failed");
-        }
-    }
     Ok(Json(api_success(json!({
         "id": id,
         "storage": "local",
-        "isPublic": false
+        "isPublic": record.3 == "public"
     }))))
 }
 
@@ -242,7 +302,7 @@ pub async fn public_gallery(
     let total: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM images
-             WHERE visibility = 'public' AND storage = 'server'
+             WHERE visibility = 'public'
                AND (?1 = '' OR lower(prompt) LIKE '%' || lower(?1) || '%')
                AND (?2 = '' OR ?2 = '全部' OR category = ?2)",
             params![search, category],
@@ -252,9 +312,9 @@ pub async fn public_gallery(
     let mut statement = connection
         .prepare(
             "SELECT i.id, i.prompt, i.size, i.model, i.created_at, i.format,
-                    i.visibility, i.category, i.storage, u.name
+                    i.visibility, i.category, i.storage, '[]', u.name
              FROM images i JOIN users u ON u.id = i.user_id
-             WHERE i.visibility = 'public' AND i.storage = 'server'
+             WHERE i.visibility = 'public'
                AND (?1 = '' OR lower(i.prompt) LIKE '%' || lower(?1) || '%')
                AND (?2 = '' OR ?2 = '全部' OR i.category = ?2)
              ORDER BY i.created_at DESC LIMIT ?3 OFFSET ?4",
@@ -264,7 +324,7 @@ pub async fn public_gallery(
         .query_map(
             params![search, category, page_size, (page - 1) * page_size],
             |row| {
-                let author: String = row.get(9)?;
+                let author: String = row.get(10)?;
                 image_from_row(row, true, Some(author))
             },
         )
@@ -411,7 +471,7 @@ async fn serve_image(
 ) -> AppResult<Response> {
     let record = database(&state.db)?
         .query_row(
-            "SELECT file_name, format, user_id, visibility, storage
+            "SELECT file_name, format, user_id, visibility
              FROM images WHERE id = ?1",
             [id],
             |row| {
@@ -420,7 +480,6 @@ async fn serve_image(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
                 ))
             },
         )
@@ -428,9 +487,9 @@ async fn serve_image(
         .map_err(internal_error)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
     let allowed = if public {
-        record.3 == "public" && record.4 == "server"
+        record.3 == "public"
     } else {
-        user_id.is_some_and(|value| value == record.2) && record.4 != "local"
+        user_id.is_some_and(|value| value == record.2)
     };
     if !allowed {
         return Err(AppError(StatusCode::NOT_FOUND, "图片不存在".into()));
@@ -1108,8 +1167,9 @@ async fn store_outputs(
                 .execute(
                     "INSERT INTO images (
                        id, user_id, file_name, prompt, size, model, created_at,
-                       visibility, format, category, storage, device_id, reference_files
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                       visibility, format, category, storage, device_id, reference_files,
+                       usage_log_id
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         file.id,
                         user.id,
@@ -1123,7 +1183,8 @@ async fn store_outputs(
                         category,
                         storage,
                         device_id,
-                        reference_files
+                        reference_files,
+                        usage_log_id
                     ],
                 )
                 .map_err(internal_error)?;
@@ -1651,24 +1712,16 @@ pub async fn delete_image(
     let user = user_from_headers(&headers, &state)?;
     let record = database(&state.db)?
         .query_row(
-            "SELECT file_name, storage, reference_files
+            "SELECT file_name, reference_files
              FROM images WHERE id = ?1 AND user_id = ?2",
             params![id, user.id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(internal_error)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
-    let mut file_names = serde_json::from_str::<Vec<String>>(&record.2).unwrap_or_default();
-    if record.1 != "local" {
-        file_names.push(record.0);
-    }
+    let mut file_names = serde_json::from_str::<Vec<String>>(&record.1).unwrap_or_default();
+    file_names.push(record.0);
     let mut moved = Vec::new();
     for file_name in file_names {
         let original = state.config.image_directory.join(file_name);
@@ -1706,24 +1759,21 @@ pub async fn clear_images(
     let file_names = {
         let connection = database(&state.db)?;
         let mut statement = connection
-            .prepare("SELECT file_name, storage, reference_files FROM images WHERE user_id = ?1")
+            .prepare(
+                "SELECT file_name, reference_files
+                 FROM images WHERE user_id = ?1",
+            )
             .map_err(internal_error)?;
         let records = statement
             .query_map([&user.id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(internal_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_error)?;
         let mut file_names = Vec::new();
-        for (file_name, storage, reference_files) in records {
-            if storage != "local" {
-                file_names.push(file_name);
-            }
+        for (file_name, reference_files) in records {
+            file_names.push(file_name);
             file_names
                 .extend(serde_json::from_str::<Vec<String>>(&reference_files).unwrap_or_default());
         }
@@ -2391,7 +2441,8 @@ mod tests {
                     let response = edit_response.clone();
                     async move { Json(response) }
                 }),
-            );
+            )
+            .fallback(|| async { StatusCode::OK });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
@@ -2501,6 +2552,12 @@ mod tests {
         .unwrap();
         assert_eq!(generated.images.len(), 2);
         assert!(generated.images.iter().all(|image| image.is_public));
+        assert_eq!(
+            std_fs::read_dir(&state.config.image_directory)
+                .unwrap()
+                .count(),
+            2
+        );
 
         let edited = perform_edit(
             &state,
@@ -2795,6 +2852,7 @@ mod tests {
             )))
             .with_state(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2826,6 +2884,11 @@ mod tests {
                 params![user.id, MODEL, now],
             )
             .unwrap();
+        std_fs::write(
+            state.config.image_directory.join("private.png"),
+            png_bytes(),
+        )
+        .unwrap();
         connection
             .execute(
                 "INSERT INTO sessions (token, user_id, created_at, expires_at)
@@ -2839,6 +2902,7 @@ mod tests {
             .route("/api/images/{id}/visibility", put(update_image_visibility))
             .with_state(state.clone());
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("PUT")
@@ -2854,7 +2918,7 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(body["data"]["isPublic"], true);
-        let visibility: String = database(&state.db)
+        let published: String = database(&state.db)
             .unwrap()
             .query_row(
                 "SELECT visibility FROM images WHERE id = 'private-image'",
@@ -2862,11 +2926,34 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(visibility, "public");
+        assert_eq!(published, "public");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/images/private-image/visibility")
+                    .header(header::COOKIE, "lumora_session=visibility-session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"isPublic":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let unpublished: String = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT visibility FROM images WHERE id = 'private-image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unpublished, "private");
     }
 
     #[tokio::test]
-    async fn localizes_pending_desktop_image_and_removes_temporary_file() {
+    async fn localizes_pending_desktop_image_and_keeps_server_backup() {
         let (_directory, state, user) = test_state(1).await;
         let now = Utc::now().to_rfc3339();
         let file_name = "pending.png";
@@ -2915,8 +3002,73 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(record, ("local".into(), "private".into()));
-        assert!(!state.config.image_directory.join(file_name).exists());
+        assert_eq!(record, ("local".into(), "public".into()));
+        assert!(state.config.image_directory.join(file_name).exists());
+    }
+
+    #[tokio::test]
+    async fn publishes_a_local_desktop_image_to_server_storage() {
+        let (_directory, state, user) = test_state(1).await;
+        let now = Utc::now().to_rfc3339();
+        let connection = database(&state.db).unwrap();
+        connection
+            .execute(
+                "INSERT INTO images (
+                   id, user_id, file_name, prompt, size, model, created_at,
+                   visibility, format, category, storage, device_id
+                 ) VALUES ('local-image', ?1, 'local.png', 'test', '1024x1024', ?2, ?3,
+                           'private', 'png', 'test', 'local', 'device-test')",
+                params![user.id, MODEL, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('publish-session', ?1, ?2, '2099-01-01T00:00:00Z')",
+                params![user.id, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let boundary = "lumora-test-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"local.png\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend(png_bytes());
+        body.extend(format!("\r\n--{boundary}--\r\n").into_bytes());
+        let app = Router::new()
+            .route("/api/images/{id}/publish", post(publish_local_image))
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/images/local-image/publish")
+                    .header(header::COOKIE, "lumora_session=publish-session")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let published: String = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT visibility FROM images WHERE id = 'local-image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(published, "public");
+        assert_eq!(
+            std_fs::read(state.config.image_directory.join("local.png")).unwrap(),
+            png_bytes()
+        );
     }
 
     #[tokio::test]
@@ -2961,8 +3113,7 @@ mod tests {
         let gallery: Value =
             serde_json::from_slice(&to_bytes(gallery_response.into_body(), 4096).await.unwrap())
                 .unwrap();
-        assert_eq!(gallery["data"]["total"], 1);
-        assert_eq!(gallery["data"]["items"][0]["id"], "public-image");
+        assert_eq!(gallery["data"]["total"], 2);
 
         let stats_response = app
             .clone()
@@ -2977,8 +3128,8 @@ mod tests {
         let stats: Value =
             serde_json::from_slice(&to_bytes(stats_response.into_body(), 4096).await.unwrap())
                 .unwrap();
-        assert_eq!(stats["data"]["publicImages"], 1);
-        assert_eq!(stats["data"]["categories"][0]["count"], 1);
+        assert_eq!(stats["data"]["publicImages"], 2);
+        assert_eq!(stats["data"]["categories"][0]["count"], 2);
 
         let private_response = app
             .clone()
@@ -2992,6 +3143,7 @@ mod tests {
             .unwrap();
         assert_eq!(private_response.status(), StatusCode::NOT_FOUND);
         let public_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/public/images/public-image")
@@ -3001,6 +3153,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(public_response.status(), StatusCode::OK);
+        let local_public_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/public/images/local-public-image")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_public_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

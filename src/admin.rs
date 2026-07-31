@@ -1,12 +1,17 @@
+use std::{net::IpAddr, time::Duration as StdDuration};
+
 use axum::{
+    body::Body,
     extract::{rejection::JsonRejection, Path as AxumPath, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::{fs, time::timeout};
 use uuid::Uuid;
 
 use crate::{
@@ -554,10 +559,15 @@ pub async fn list_usage_logs(
             "SELECT l.id, l.user_id, u.email, COALESCE(p.name, ''), l.endpoint,
                     l.model, l.status, l.duration_ms, l.credits_used,
                     l.ip_address, l.device_id, l.platform, l.app_version,
-                    l.user_agent, l.created_at
+                    l.user_agent, l.created_at, i.id
              FROM usage_logs l
              JOIN users u ON u.id = l.user_id
              LEFT JOIN providers p ON p.id = l.provider_id
+             LEFT JOIN images i ON i.id = (
+               SELECT image.id FROM images image
+               WHERE image.usage_log_id = l.id
+               ORDER BY image.created_at, image.id LIMIT 1
+             )
              WHERE (?1 = '' OR lower(u.email) LIKE ?2 OR lower(l.ip_address) LIKE ?2
                     OR lower(l.device_id) LIKE ?2 OR lower(l.endpoint) LIKE ?2)
                AND (?3 = '' OR l.status = ?3)
@@ -568,6 +578,9 @@ pub async fn list_usage_logs(
         .query_map(
             params![search, pattern, status, page_size, (page - 1) * page_size],
             |row| {
+                let image_url = row
+                    .get::<_, Option<String>>(15)?
+                    .map(|id| format!("/api/admin/images/{id}/file"));
                 Ok(json!({
                     "id": row.get::<_, String>(0)?,
                     "userId": row.get::<_, String>(1)?,
@@ -583,7 +596,8 @@ pub async fn list_usage_logs(
                     "platform": row.get::<_, String>(11)?,
                     "appVersion": row.get::<_, String>(12)?,
                     "userAgent": row.get::<_, String>(13)?,
-                    "createdAt": row.get::<_, String>(14)?
+                    "createdAt": row.get::<_, String>(14)?,
+                    "imageUrl": image_url
                 }))
             },
         )
@@ -595,6 +609,163 @@ pub async fn list_usage_logs(
         "total": total,
         "page": page,
         "pageSize": page_size
+    }))))
+}
+
+pub async fn image_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Response> {
+    admin_user(&headers, &state)?;
+    let record = database(&state.db)?
+        .query_row(
+            "SELECT file_name, format, storage FROM images WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
+    let bytes = fs::read(state.config.image_directory.join(record.0))
+        .await
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "图片文件不存在".into()))?;
+    let content_type = match record.1.as_str() {
+        "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct IpLocationQuery {
+    ip: String,
+}
+
+#[derive(Deserialize)]
+struct IpWhoResponse {
+    success: bool,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    country: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    city: String,
+    connection: Option<IpWhoConnection>,
+}
+
+#[derive(Deserialize)]
+struct IpWhoConnection {
+    #[serde(default)]
+    isp: String,
+}
+
+pub async fn ip_location(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<IpLocationQuery>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    admin_user(&headers, &state)?;
+    let ip = query
+        .ip
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "IP 地址无效".into()))?
+        .to_string();
+    let cached = database(&state.db)?
+        .query_row(
+            "SELECT location, isp FROM ip_locations WHERE ip = ?1",
+            [&ip],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(internal_error)?;
+    if let Some((location, isp)) = cached {
+        return Ok(Json(api_success(json!({
+            "ip": ip,
+            "location": location,
+            "isp": isp,
+            "cached": true
+        }))));
+    }
+
+    let lookup_url = format!("https://ipwho.is/{ip}");
+    let result = timeout(StdDuration::from_secs(8), async {
+        state
+            .client
+            .get(lookup_url)
+            .query(&[
+                (
+                    "fields",
+                    "success,message,country,region,city,connection.isp",
+                ),
+                ("lang", "zh-CN"),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<IpWhoResponse>()
+            .await
+    })
+    .await
+    .map_err(|_| AppError(StatusCode::GATEWAY_TIMEOUT, "IP 地区查询超时".into()))?
+    .map_err(|error| {
+        tracing::error!(error = %error, "IP location lookup failed");
+        AppError(StatusCode::BAD_GATEWAY, "IP 地区查询失败".into())
+    })?;
+    if !result.success {
+        return Err(AppError(
+            StatusCode::BAD_GATEWAY,
+            if result.message.is_empty() {
+                "IP 地区查询失败".into()
+            } else {
+                result.message
+            },
+        ));
+    }
+    let mut parts = Vec::new();
+    for part in [result.country, result.region, result.city] {
+        if !part.is_empty() && !parts.contains(&part) {
+            parts.push(part);
+        }
+    }
+    if parts.is_empty() {
+        return Err(AppError(StatusCode::BAD_GATEWAY, "未查询到 IP 地区".into()));
+    }
+    let location = parts.join(" · ");
+    let isp = result.connection.map(|item| item.isp).unwrap_or_default();
+    database(&state.db)?
+        .execute(
+            "INSERT INTO ip_locations (ip, location, isp, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(ip) DO UPDATE SET
+               location = excluded.location,
+               isp = excluded.isp,
+               updated_at = excluded.updated_at",
+            params![ip, location, isp, Utc::now().to_rfc3339()],
+        )
+        .map_err(internal_error)?;
+    Ok(Json(api_success(json!({
+        "ip": ip,
+        "location": location,
+        "isp": isp,
+        "cached": false
     }))))
 }
 

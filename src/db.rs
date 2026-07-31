@@ -14,7 +14,7 @@ use crate::{
 use axum::http::StatusCode;
 
 pub type Database = Arc<Mutex<Connection>>;
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 pub fn open_database(
     data_directory: &Path,
@@ -65,6 +65,13 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
            token TEXT PRIMARY KEY,
            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS email_verifications (
+           email TEXT PRIMARY KEY,
+           code_hash TEXT NOT NULL,
+           expires_at TEXT NOT NULL,
+           last_sent_at TEXT NOT NULL,
+           attempts INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS api_keys (
            id TEXT PRIMARY KEY,
@@ -164,6 +171,12 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS system_settings (
            key TEXT PRIMARY KEY,
            value INTEGER NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS ip_locations (
+           ip TEXT PRIMARY KEY,
+           location TEXT NOT NULL,
+           isp TEXT NOT NULL,
            updated_at TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -267,6 +280,12 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
     )?;
     add_column(
         connection,
+        "images",
+        "usage_log_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column(
+        connection,
         "usage_logs",
         "ip_address",
         "TEXT NOT NULL DEFAULT ''",
@@ -298,6 +317,8 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_images_public_storage_created
          ON images(visibility, storage, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_images_usage_log
+           ON images(usage_log_id);
          CREATE INDEX IF NOT EXISTS idx_usage_created
            ON usage_logs(created_at DESC);
          INSERT OR IGNORE INTO system_settings (key, value, updated_at)

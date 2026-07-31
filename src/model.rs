@@ -218,9 +218,16 @@ pub struct UsageResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuthRequest {
     pub email: String,
     pub password: String,
+    pub verification_code: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct EmailCodeRequest {
+    pub email: String,
 }
 
 #[derive(Deserialize)]
