@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Instant};
 
 use axum::{
     body::{to_bytes, Body},
@@ -39,6 +39,15 @@ struct GeneratedOutput {
     encoded: String,
     bytes: Vec<u8>,
     format: String,
+}
+
+struct StoredOutput {
+    id: String,
+    file_name: String,
+    path: PathBuf,
+    encoded: String,
+    format: String,
+    reference_files: Vec<(String, PathBuf)>,
 }
 
 struct GenerationResult {
@@ -122,7 +131,7 @@ pub async fn list_images(
     let mut statement = connection
         .prepare(
             "SELECT id, prompt, size, model, created_at, format, visibility, category,
-                    storage
+                    storage, reference_files
              FROM images
              WHERE user_id = ?1 AND (storage = 'server' OR device_id = ?2)
              ORDER BY created_at DESC",
@@ -276,6 +285,16 @@ fn image_from_row(
     author: Option<String>,
 ) -> rusqlite::Result<ImageResponse> {
     let id: String = row.get(0)?;
+    let reference_images = if public {
+        Vec::new()
+    } else {
+        serde_json::from_str::<Vec<String>>(&row.get::<_, String>(9)?)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("/api/images/{id}/references/{index}"))
+            .collect()
+    };
     Ok(ImageResponse {
         url: if public {
             format!("/public/images/{id}")
@@ -293,6 +312,7 @@ fn image_from_row(
         category: row.get(7)?,
         storage: row.get(8)?,
         author,
+        reference_images,
     })
 }
 
@@ -305,11 +325,82 @@ pub async fn private_image_file(
     serve_image(&state, &id, Some(&user.id), false).await
 }
 
+pub async fn private_image_reference_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((id, index)): AxumPath<(String, usize)>,
+) -> AppResult<Response> {
+    let user = user_from_headers(&headers, &state)?;
+    let reference_files = database(&state.db)?
+        .query_row(
+            "SELECT reference_files FROM images WHERE id = ?1 AND user_id = ?2",
+            params![id, user.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "参考图不存在".into()))?;
+    let file_name = serde_json::from_str::<Vec<String>>(&reference_files)
+        .unwrap_or_default()
+        .get(index)
+        .cloned()
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "参考图不存在".into()))?;
+    let bytes = fs::read(state.config.image_directory.join(file_name))
+        .await
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "参考图文件不存在".into()))?;
+    let (format, _) = detect_image_format(&bytes)
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "参考图文件无效".into()))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime_for_format(format)),
+            (header::CACHE_CONTROL, "private, no-store"),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
 pub async fn public_image_file(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> AppResult<Response> {
     serve_image(&state, &id, None, true).await
+}
+
+pub async fn private_task_reference_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((id, index)): AxumPath<(String, usize)>,
+) -> AppResult<Response> {
+    let user = user_from_headers(&headers, &state)?;
+    let request_json = database(&state.db)?
+        .query_row(
+            "SELECT request_json FROM tasks WHERE id = ?1 AND user_id = ?2",
+            params![id, user.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "参考图不存在".into()))?;
+    let payload = serde_json::from_str::<TaskPayload>(&request_json)
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "参考图不存在".into()))?;
+    let file_name = payload
+        .input_files
+        .get(index)
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "参考图不存在".into()))?;
+    let bytes = fs::read(state.config.task_directory.join(&id).join(file_name))
+        .await
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "参考图文件不存在".into()))?;
+    let (format, _) = detect_image_format(&bytes)
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "参考图文件无效".into()))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime_for_format(format)),
+            (header::CACHE_CONTROL, "private, no-store"),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
 }
 
 async fn serve_image(
@@ -588,6 +679,7 @@ async fn perform_generation(
         &request,
         metadata,
         outputs,
+        &[],
         request.n as i64,
         endpoint,
         duration_ms,
@@ -620,6 +712,7 @@ async fn perform_edit(
     }
     let started = Instant::now();
     let mut outputs = Vec::new();
+    let mut output_references = Vec::new();
     let mut errors = Vec::new();
     let mut usage = None;
     if request.batch {
@@ -635,6 +728,8 @@ async fn perform_edit(
             };
             match request_upstream_edit(&state.client, &provider, &one).await {
                 Ok((mut generated, current_usage)) => {
+                    output_references
+                        .extend(std::iter::repeat_n(vec![input.clone()], generated.len()));
                     outputs.append(&mut generated);
                     usage = current_usage.or(usage);
                 }
@@ -658,6 +753,8 @@ async fn perform_edit(
         while let Some(result) = requests.join_next().await {
             match result {
                 Ok(Ok((mut generated, current_usage))) => {
+                    output_references
+                        .extend(std::iter::repeat_n(request.images.clone(), generated.len()));
                     outputs.append(&mut generated);
                     usage = current_usage.or(usage);
                 }
@@ -692,6 +789,7 @@ async fn perform_edit(
         &request.generation,
         metadata,
         outputs,
+        &output_references,
         reserved,
         endpoint,
         duration_ms,
@@ -851,6 +949,7 @@ async fn store_outputs(
     request: &GenerateRequest,
     metadata: &RequestMetadata,
     outputs: Vec<GeneratedOutput>,
+    output_references: &[Vec<ImageInput>],
     reserved: i64,
     endpoint: &str,
     duration_ms: i64,
@@ -860,14 +959,18 @@ async fn store_outputs(
 ) -> AppResult<GenerationResult> {
     let created_at = Utc::now().to_rfc3339();
     let category = prompt_category(&request.prompt);
-    let mut files = Vec::new();
-    for output in outputs {
+    let mut files: Vec<StoredOutput> = Vec::new();
+    for (output_index, output) in outputs.into_iter().enumerate() {
         let image_id = format!("img-{}", Uuid::new_v4().simple());
         let file_name = format!("{}.{}", Uuid::new_v4().simple(), output.format);
         let path = state.config.image_directory.join(&file_name);
         if let Err(error) = fs::write(&path, &output.bytes).await {
-            for (_, _, existing_path, _, _) in &files {
-                let _ = fs::remove_file(existing_path).await;
+            let _ = fs::remove_file(&path).await;
+            for file in &files {
+                let _ = fs::remove_file(&file.path).await;
+                for (_, reference_path) in &file.reference_files {
+                    let _ = fs::remove_file(reference_path).await;
+                }
             }
             settle_failure(
                 state,
@@ -886,7 +989,54 @@ async fn store_outputs(
                 "图片保存失败".into(),
             ));
         }
-        files.push((image_id, file_name, path, output.encoded, output.format));
+        let mut reference_files = Vec::new();
+        for (reference_index, input) in output_references
+            .get(output_index)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let extension = detect_image_format(&input.bytes).map_or("png", |item| item.0);
+            let reference_file_name = format!("{image_id}-reference-{reference_index}.{extension}");
+            let reference_path = state.config.image_directory.join(&reference_file_name);
+            if fs::write(&reference_path, &input.bytes).await.is_err() {
+                let _ = fs::remove_file(&path).await;
+                let _ = fs::remove_file(&reference_path).await;
+                for (_, existing_path) in &reference_files {
+                    let _ = fs::remove_file(existing_path).await;
+                }
+                for file in &files {
+                    let _ = fs::remove_file(&file.path).await;
+                    for (_, existing_path) in &file.reference_files {
+                        let _ = fs::remove_file(existing_path).await;
+                    }
+                }
+                settle_failure(
+                    state,
+                    &user.id,
+                    Some(&provider.id),
+                    reserved,
+                    metadata,
+                    endpoint,
+                    duration_ms,
+                    task_id,
+                    "参考图保存失败",
+                )?;
+                return Err(AppError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "参考图保存失败".into(),
+                ));
+            }
+            reference_files.push((reference_file_name, reference_path));
+        }
+        files.push(StoredOutput {
+            id: image_id,
+            file_name,
+            path,
+            encoded: output.encoded,
+            format: output.format,
+            reference_files,
+        });
     }
 
     let used = files.len() as i64;
@@ -945,26 +1095,35 @@ async fn store_outputs(
                 ],
             )
             .map_err(internal_error)?;
-        for (image_id, file_name, _, _, format) in &files {
+        for file in &files {
+            let reference_files = serde_json::to_string(
+                &file
+                    .reference_files
+                    .iter()
+                    .map(|(file_name, _)| file_name)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "参考图记录无效".into()))?;
             transaction
                 .execute(
                     "INSERT INTO images (
                        id, user_id, file_name, prompt, size, model, created_at,
-                       visibility, format, category, storage, device_id
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                       visibility, format, category, storage, device_id, reference_files
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
-                        image_id,
+                        file.id,
                         user.id,
-                        file_name,
+                        file.file_name,
                         request.prompt.trim(),
                         request.size,
                         provider.model,
                         created_at,
                         visibility,
-                        format,
+                        file.format,
                         category,
                         storage,
-                        device_id
+                        device_id,
+                        reference_files
                     ],
                 )
                 .map_err(internal_error)?;
@@ -999,7 +1158,7 @@ async fn store_outputs(
                 .execute(
                     "UPDATE tasks SET status = 'success', image_id = ?1, credits_used = ?2,
                      error = NULL, updated_at = ?3 WHERE id = ?4 AND user_id = ?5",
-                    params![files[0].0, used, created_at, task_id, user.id],
+                    params![files[0].id, used, created_at, task_id, user.id],
                 )
                 .map_err(internal_error)?;
         }
@@ -1007,8 +1166,11 @@ async fn store_outputs(
         Ok(())
     })();
     if let Err(error) = transaction_result {
-        for (_, _, path, _, _) in &files {
-            let _ = fs::remove_file(path).await;
+        for file in &files {
+            let _ = fs::remove_file(&file.path).await;
+            for (_, reference_path) in &file.reference_files {
+                let _ = fs::remove_file(reference_path).await;
+            }
         }
         settle_failure(
             state,
@@ -1033,24 +1195,30 @@ async fn store_outputs(
         .map_err(internal_error)?;
     let images = files
         .iter()
-        .map(|(id, _, _, _, format)| ImageResponse {
-            id: id.clone(),
-            url: format!("/api/images/{id}/file"),
+        .map(|file| ImageResponse {
+            id: file.id.clone(),
+            url: format!("/api/images/{}/file", file.id),
             prompt: request.prompt.trim().into(),
             size: request.size.clone(),
             model: provider.model.clone(),
             created_at: created_at.clone(),
             source: "generated",
-            format: format.clone(),
+            format: file.format.clone(),
             is_public: request.is_public,
             category: category.into(),
             storage: storage.into(),
             author: None,
+            reference_images: file
+                .reference_files
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("/api/images/{}/references/{index}", file.id))
+                .collect(),
         })
         .collect();
     Ok(GenerationResult {
         images,
-        encoded: files.into_iter().map(|item| item.3).collect(),
+        encoded: files.into_iter().map(|file| file.encoded).collect(),
         credits,
         usage,
         errors,
@@ -1483,19 +1651,35 @@ pub async fn delete_image(
     let user = user_from_headers(&headers, &state)?;
     let record = database(&state.db)?
         .query_row(
-            "SELECT file_name, storage FROM images WHERE id = ?1 AND user_id = ?2",
+            "SELECT file_name, storage, reference_files
+             FROM images WHERE id = ?1 AND user_id = ?2",
             params![id, user.id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(internal_error)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
-    let original = state.config.image_directory.join(&record.0);
-    let trash = state
-        .config
-        .image_directory
-        .join(format!(".deleting-{}", Uuid::new_v4().simple()));
-    let renamed = record.1 != "local" && fs::rename(&original, &trash).await.is_ok();
+    let mut file_names = serde_json::from_str::<Vec<String>>(&record.2).unwrap_or_default();
+    if record.1 != "local" {
+        file_names.push(record.0);
+    }
+    let mut moved = Vec::new();
+    for file_name in file_names {
+        let original = state.config.image_directory.join(file_name);
+        let trash = state
+            .config
+            .image_directory
+            .join(format!(".deleting-{}", Uuid::new_v4().simple()));
+        if fs::rename(&original, &trash).await.is_ok() {
+            moved.push((original, trash));
+        }
+    }
     let changed = database(&state.db)?
         .execute(
             "DELETE FROM images WHERE id = ?1 AND user_id = ?2",
@@ -1503,12 +1687,12 @@ pub async fn delete_image(
         )
         .map_err(internal_error);
     if let Err(error) = changed {
-        if renamed {
-            let _ = fs::rename(&trash, &original).await;
+        for (original, trash) in moved {
+            let _ = fs::rename(trash, original).await;
         }
         return Err(error);
     }
-    if renamed {
+    for (_, trash) in moved {
         let _ = fs::remove_file(trash).await;
     }
     Ok(Json(api_success(Value::Null)))
@@ -1522,13 +1706,27 @@ pub async fn clear_images(
     let file_names = {
         let connection = database(&state.db)?;
         let mut statement = connection
-            .prepare("SELECT file_name FROM images WHERE user_id = ?1 AND storage != 'local'")
+            .prepare("SELECT file_name, storage, reference_files FROM images WHERE user_id = ?1")
             .map_err(internal_error)?;
-        let file_names = statement
-            .query_map([&user.id], |row| row.get::<_, String>(0))
+        let records = statement
+            .query_map([&user.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
             .map_err(internal_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_error)?;
+        let mut file_names = Vec::new();
+        for (file_name, storage, reference_files) in records {
+            if storage != "local" {
+                file_names.push(file_name);
+            }
+            file_names
+                .extend(serde_json::from_str::<Vec<String>>(&reference_files).unwrap_or_default());
+        }
         file_names
     };
     let mut moved = Vec::new();
@@ -1994,10 +2192,17 @@ fn task_summaries(state: &AppState, user_id: &str, ids: &[String]) -> AppResult<
         };
         let payload: TaskPayload = serde_json::from_str(&request_json)
             .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "任务数据无效".into()))?;
+        let reference_images = payload
+            .input_files
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("/api/image-tasks/{id}/references/{index}"))
+            .collect::<Vec<_>>();
         items.push(json!({
             "id": id,
             "status": status,
             "prompt": payload.generation.prompt,
+            "referenceImages": reference_images,
             "imageId": image_id,
             "error": error,
             "createdAt": created_at,
@@ -2325,6 +2530,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(edited.images.len(), 2);
+        assert!(edited
+            .images
+            .iter()
+            .all(|image| image.reference_images.len() == 1));
         let balances: (i64, i64) = database(&state.db)
             .unwrap()
             .query_row(
@@ -2498,7 +2707,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         let payload = serde_json::to_string(&TaskPayload {
             generation: generation_request(1),
-            input_files: Vec::new(),
+            input_files: vec!["input-0.png".into()],
             mask_file: None,
             request_metadata: RequestMetadata::default(),
         })
@@ -2549,6 +2758,10 @@ mod tests {
         assert_eq!(active["data"]["items"].as_array().unwrap().len(), 1);
         assert_eq!(active["data"]["items"][0]["id"], "task-active");
         assert_eq!(active["data"]["items"][0]["prompt"], "A test image");
+        assert_eq!(
+            active["data"]["items"][0]["referenceImages"][0],
+            "/api/image-tasks/task-active/references/0"
+        );
         assert_eq!(active["data"]["items"][0]["createdAt"], now);
 
         let requested_response = app

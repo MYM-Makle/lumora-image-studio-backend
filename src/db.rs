@@ -14,7 +14,7 @@ use crate::{
 use axum::http::StatusCode;
 
 pub type Database = Arc<Mutex<Connection>>;
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 pub fn open_database(
     data_directory: &Path,
@@ -258,6 +258,12 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
         "images",
         "device_id",
         "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column(
+        connection,
+        "images",
+        "reference_files",
+        "TEXT NOT NULL DEFAULT '[]'",
     )?;
     add_column(
         connection,

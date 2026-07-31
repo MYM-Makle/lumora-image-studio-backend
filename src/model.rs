@@ -148,6 +148,8 @@ pub struct ImageResponse {
     pub storage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reference_images: Vec<String>,
 }
 
 #[derive(Serialize)]
