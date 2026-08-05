@@ -1,23 +1,22 @@
 use std::{net::IpAddr, time::Duration as StdDuration};
 
 use axum::{
-    body::Body,
     extract::{rejection::JsonRejection, Path as AxumPath, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::Response,
     Json,
 };
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::{fs, time::timeout};
+use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::{
     account::normalize_base_url,
     auth::user_from_headers,
-    db::{database, internal_error},
+    db::{internal_error, read_database, utc_day_bounds, write_database},
     model::{
         api_json, api_success, ApiResponse, AppError, AppResult, CreateProviderRequest,
         ProviderResponse, UserResponse, MODEL,
@@ -28,15 +27,17 @@ use crate::{
 
 fn admin_user(headers: &HeaderMap, state: &AppState) -> AppResult<UserResponse> {
     let user = user_from_headers(headers, state)?;
-    let is_admin = database(&state.db)?
-        .query_row(
-            "SELECT is_admin FROM users WHERE id = ?1 AND status = 'active'",
-            [&user.id],
-            |row| row.get::<_, bool>(0),
-        )
-        .optional()
-        .map_err(internal_error)?
-        .unwrap_or(false);
+    let is_admin = read_database(&state.db, |connection| {
+        connection
+            .query_row(
+                "SELECT is_admin FROM users WHERE id = ?1 AND status = 'active'",
+                [&user.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(internal_error)
+            .map(|value| value.unwrap_or(false))
+    })?;
     if !is_admin {
         return Err(AppError(StatusCode::FORBIDDEN, "需要管理员权限".into()));
     }
@@ -81,116 +82,124 @@ pub async fn overview(
     headers: HeaderMap,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     admin_user(&headers, &state)?;
-    let connection = database(&state.db)?;
-    let now = Utc::now();
-    let today = now.format("%Y-%m-%d").to_string();
-    let month_start = (now - Duration::days(29)).format("%Y-%m-%d").to_string();
-    let online_cutoff = (now - Duration::minutes(5)).to_rfc3339();
-    let total_users = connection
-        .query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))
-        .map_err(internal_error)?;
-    let today_new_users = connection
-        .query_row(
-            "SELECT COUNT(*) FROM users WHERE substr(created_at, 1, 10) = ?1",
-            [&today],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    let daily_active_users = connection
-        .query_row(
-            "SELECT COUNT(*) FROM activity_days WHERE activity_date = ?1",
-            [&today],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    let monthly_active_users = connection
-        .query_row(
-            "SELECT COUNT(DISTINCT user_id) FROM activity_days WHERE activity_date >= ?1",
-            [&month_start],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    let online_users = connection
-        .query_row(
-            "SELECT COUNT(*) FROM users WHERE status = 'active' AND last_seen_at >= ?1",
-            [&online_cutoff],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    let devices = connection
-        .query_row("SELECT COUNT(*) FROM devices", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(internal_error)?;
-    let (total_calls, success_calls, today_calls, credits_used) = connection
-        .query_row(
-            "SELECT COUNT(*),
-                    COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN substr(created_at, 1, 10) = ?1 THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(credits_used), 0)
-             FROM usage_logs",
-            [&today],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )
-        .map_err(internal_error)?;
-    let total_images = connection
-        .query_row("SELECT COUNT(*) FROM images", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(internal_error)?;
-    let success_rate = if total_calls == 0 {
-        0.0
-    } else {
-        success_calls as f64 / total_calls as f64 * 100.0
-    };
-    let mut daily = Vec::with_capacity(14);
-    for offset in (0..14).rev() {
-        let date = (now - Duration::days(offset))
-            .format("%Y-%m-%d")
-            .to_string();
-        let active_users = connection
+    read_database(&state.db, |connection| {
+        let now = Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let (today_start, tomorrow_start) = utc_day_bounds(now);
+        let month_start = (now - Duration::days(29)).format("%Y-%m-%d").to_string();
+        let online_cutoff = (now - Duration::minutes(5)).to_rfc3339();
+        let total_users = connection
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))
+            .map_err(internal_error)?;
+        let today_new_users = connection
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE created_at >= ?1 AND created_at < ?2",
+                params![today_start, tomorrow_start],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        let daily_active_users = connection
             .query_row(
                 "SELECT COUNT(*) FROM activity_days WHERE activity_date = ?1",
-                [&date],
+                [&today],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(internal_error)?;
-        let generations = connection
+        let monthly_active_users = connection
             .query_row(
-                "SELECT COUNT(*) FROM usage_logs
-                 WHERE status = 'success' AND substr(created_at, 1, 10) = ?1",
-                [&date],
+                "SELECT COUNT(DISTINCT user_id) FROM activity_days WHERE activity_date >= ?1",
+                [&month_start],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(internal_error)?;
-        daily.push(json!({
-            "date": date,
-            "activeUsers": active_users,
-            "generations": generations
-        }));
-    }
+        let online_users = connection
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE status = 'active' AND last_seen_at >= ?1",
+                [&online_cutoff],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        let devices = connection
+            .query_row("SELECT COUNT(*) FROM devices", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(internal_error)?;
+        let (total_calls, success_calls, today_calls, credits_used) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM usage_logs) +
+                     (SELECT COALESCE(SUM(request_count), 0) FROM usage_daily_summary),
+                   (SELECT COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0)
+                    FROM usage_logs) +
+                     (SELECT COALESCE(SUM(request_count), 0) FROM usage_daily_summary
+                      WHERE status = 'success'),
+                   (SELECT COUNT(*) FROM usage_logs
+                    WHERE created_at >= ?1 AND created_at < ?2),
+                   (SELECT COALESCE(SUM(credits_used), 0) FROM usage_logs) +
+                     (SELECT COALESCE(SUM(total_credits_used), 0) FROM usage_daily_summary)",
+                params![today_start, tomorrow_start],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(internal_error)?;
+        let total_images = connection
+            .query_row("SELECT COUNT(*) FROM images", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(internal_error)?;
+        let success_rate = if total_calls == 0 {
+            0.0
+        } else {
+            success_calls as f64 / total_calls as f64 * 100.0
+        };
+        let mut daily = Vec::with_capacity(14);
+        for offset in (0..14).rev() {
+            let day = now - Duration::days(offset);
+            let date = day.format("%Y-%m-%d").to_string();
+            let (day_start, next_day_start) = utc_day_bounds(day);
+            let active_users = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM activity_days WHERE activity_date = ?1",
+                    [&date],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(internal_error)?;
+            let generations = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_logs
+                     WHERE status = 'success' AND created_at >= ?1 AND created_at < ?2",
+                    params![day_start, next_day_start],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(internal_error)?;
+            daily.push(json!({
+                "date": date,
+                "activeUsers": active_users,
+                "generations": generations
+            }));
+        }
 
-    Ok(Json(api_success(json!({
-        "totalUsers": total_users,
-        "todayNewUsers": today_new_users,
-        "dailyActiveUsers": daily_active_users,
-        "monthlyActiveUsers": monthly_active_users,
-        "onlineUsers": online_users,
-        "devices": devices,
-        "totalCalls": total_calls,
-        "todayCalls": today_calls,
-        "successRate": success_rate,
-        "creditsUsed": credits_used,
-        "totalImages": total_images,
-        "daily": daily
-    }))))
+        Ok(Json(api_success(json!({
+            "totalUsers": total_users,
+            "todayNewUsers": today_new_users,
+            "dailyActiveUsers": daily_active_users,
+            "monthlyActiveUsers": monthly_active_users,
+            "onlineUsers": online_users,
+            "devices": devices,
+            "totalCalls": total_calls,
+            "todayCalls": today_calls,
+            "successRate": success_rate,
+            "creditsUsed": credits_used,
+            "totalImages": total_images,
+            "daily": daily
+        }))))
+    })
 }
 
 #[derive(Deserialize)]
@@ -216,64 +225,69 @@ pub async fn list_users(
     if !status.is_empty() && !["active", "disabled"].contains(&status.as_str()) {
         return Err(AppError(StatusCode::BAD_REQUEST, "用户状态无效".into()));
     }
-    let connection = database(&state.db)?;
-    let total = connection
-        .query_row(
-            "SELECT COUNT(*) FROM users
+    read_database(&state.db, |connection| {
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*) FROM users
              WHERE (?1 = '' OR lower(email) LIKE ?2 OR lower(name) LIKE ?2)
                AND (?3 = '' OR status = ?3)",
-            params![search, pattern, status],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT u.id, u.name, u.email, u.plan, u.credits, u.credits_reserved,
+                params![search, pattern, status],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT u.id, u.name, u.email, u.plan, u.credits, u.credits_reserved,
                     u.daily_limit, u.status, u.is_admin, u.created_at,
                     u.last_login_at, u.last_seen_at,
-                    (SELECT COUNT(*) FROM usage_logs l WHERE l.user_id = u.id),
+                    (SELECT COUNT(*) FROM usage_logs l WHERE l.user_id = u.id) +
+                      (SELECT COALESCE(SUM(s.request_count), 0)
+                       FROM usage_daily_summary s WHERE s.user_id = u.id),
                     (SELECT COALESCE(SUM(l.credits_used), 0)
-                     FROM usage_logs l WHERE l.user_id = u.id)
+                     FROM usage_logs l WHERE l.user_id = u.id) +
+                      (SELECT COALESCE(SUM(s.total_credits_used), 0)
+                       FROM usage_daily_summary s WHERE s.user_id = u.id)
              FROM users u
              WHERE (?1 = '' OR lower(u.email) LIKE ?2 OR lower(u.name) LIKE ?2)
                AND (?3 = '' OR u.status = ?3)
              ORDER BY u.created_at DESC LIMIT ?4 OFFSET ?5",
-        )
-        .map_err(internal_error)?;
-    let items = statement
-        .query_map(
-            params![search, pattern, status, page_size, (page - 1) * page_size],
-            |row| {
-                let credits = row.get::<_, i64>(4)?;
-                let reserved = row.get::<_, i64>(5)?;
-                Ok(json!({
-                    "id": row.get::<_, String>(0)?,
-                    "name": row.get::<_, String>(1)?,
-                    "email": row.get::<_, String>(2)?,
-                    "plan": row.get::<_, String>(3)?,
-                    "credits": credits,
-                    "creditsReserved": reserved,
-                    "availableCredits": credits - reserved,
-                    "dailyLimit": row.get::<_, i64>(6)?,
-                    "status": row.get::<_, String>(7)?,
-                    "isAdmin": row.get::<_, bool>(8)?,
-                    "createdAt": row.get::<_, String>(9)?,
-                    "lastLoginAt": row.get::<_, Option<String>>(10)?,
-                    "lastSeenAt": row.get::<_, Option<String>>(11)?,
-                    "totalCalls": row.get::<_, i64>(12)?,
-                    "creditsUsed": row.get::<_, i64>(13)?
-                }))
-            },
-        )
-        .map_err(internal_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal_error)?;
-    Ok(Json(api_success(json!({
-        "items": items,
-        "total": total,
-        "page": page,
-        "pageSize": page_size
-    }))))
+            )
+            .map_err(internal_error)?;
+        let items = statement
+            .query_map(
+                params![search, pattern, status, page_size, (page - 1) * page_size],
+                |row| {
+                    let credits = row.get::<_, i64>(4)?;
+                    let reserved = row.get::<_, i64>(5)?;
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "name": row.get::<_, String>(1)?,
+                        "email": row.get::<_, String>(2)?,
+                        "plan": row.get::<_, String>(3)?,
+                        "credits": credits,
+                        "creditsReserved": reserved,
+                        "availableCredits": credits - reserved,
+                        "dailyLimit": row.get::<_, i64>(6)?,
+                        "status": row.get::<_, String>(7)?,
+                        "isAdmin": row.get::<_, bool>(8)?,
+                        "createdAt": row.get::<_, String>(9)?,
+                        "lastLoginAt": row.get::<_, Option<String>>(10)?,
+                        "lastSeenAt": row.get::<_, Option<String>>(11)?,
+                        "totalCalls": row.get::<_, i64>(12)?,
+                        "creditsUsed": row.get::<_, i64>(13)?
+                    }))
+                },
+            )
+            .map_err(internal_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        Ok(Json(api_success(json!({
+            "items": items,
+            "total": total,
+            "page": page,
+            "pageSize": page_size
+        }))))
+    })
 }
 
 #[derive(Deserialize)]
@@ -293,66 +307,68 @@ pub async fn update_user(
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let request = api_json(payload)?;
     let admin = admin_user(&headers, &state)?;
-    let mut connection = database(&state.db)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal_error)?;
-    let current = transaction
-        .query_row(
-            "SELECT status, plan, daily_limit, is_admin FROM users WHERE id = ?1",
-            [&id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            },
+    write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let current = transaction
+            .query_row(
+                "SELECT status, plan, daily_limit, is_admin FROM users WHERE id = ?1",
+                [&id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal_error)?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "用户不存在".into()))?;
+        let status = request.status.unwrap_or(current.0);
+        let plan = request.plan.unwrap_or(current.1).trim().to_string();
+        let daily_limit = request.daily_limit.unwrap_or(current.2);
+        let is_admin = request.is_admin.unwrap_or(current.3);
+        if !["active", "disabled"].contains(&status.as_str())
+            || plan.is_empty()
+            || plan.len() > 40
+            || !(1..=1_000_000).contains(&daily_limit)
+        {
+            return Err(AppError(StatusCode::BAD_REQUEST, "用户参数无效".into()));
+        }
+        if id == admin.id && (status != "active" || !is_admin) {
+            return Err(AppError(
+                StatusCode::CONFLICT,
+                "不能停用自己的管理员权限".into(),
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE users
+                 SET status = ?1, plan = ?2, daily_limit = ?3, is_admin = ?4
+                 WHERE id = ?5",
+                params![status, plan, daily_limit, is_admin, id],
+            )
+            .map_err(internal_error)?;
+        write_audit(
+            &transaction,
+            &admin.id,
+            "update_user",
+            "user",
+            &id,
+            json!({
+                "status": status,
+                "plan": plan,
+                "dailyLimit": daily_limit,
+                "isAdmin": is_admin
+            }),
         )
-        .optional()
-        .map_err(internal_error)?
-        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "用户不存在".into()))?;
-    let status = request.status.unwrap_or(current.0);
-    let plan = request.plan.unwrap_or(current.1).trim().to_string();
-    let daily_limit = request.daily_limit.unwrap_or(current.2);
-    let is_admin = request.is_admin.unwrap_or(current.3);
-    if !["active", "disabled"].contains(&status.as_str())
-        || plan.is_empty()
-        || plan.len() > 40
-        || !(1..=1_000_000).contains(&daily_limit)
-    {
-        return Err(AppError(StatusCode::BAD_REQUEST, "用户参数无效".into()));
-    }
-    if id == admin.id && (status != "active" || !is_admin) {
-        return Err(AppError(
-            StatusCode::CONFLICT,
-            "不能停用自己的管理员权限".into(),
-        ));
-    }
-    transaction
-        .execute(
-            "UPDATE users
-             SET status = ?1, plan = ?2, daily_limit = ?3, is_admin = ?4
-             WHERE id = ?5",
-            params![status, plan, daily_limit, is_admin, id],
-        )
         .map_err(internal_error)?;
-    write_audit(
-        &transaction,
-        &admin.id,
-        "update_user",
-        "user",
-        &id,
-        json!({
-            "status": status,
-            "plan": plan,
-            "dailyLimit": daily_limit,
-            "isAdmin": is_admin
-        }),
-    )
-    .map_err(internal_error)?;
-    transaction.commit().map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        Ok(())
+    })?;
     Ok(Json(api_success(Value::Null)))
 }
 
@@ -384,78 +400,79 @@ pub async fn adjust_credits(
         return Err(AppError(StatusCode::BAD_REQUEST, "积分调整参数无效".into()));
     }
     let reference_id = format!("admin:{request_id}");
-    let mut connection = database(&state.db)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal_error)?;
-    if let Some(existing) = transaction
-        .query_row(
-            "SELECT user_id, delta, balance_after FROM credit_ledger WHERE reference_id = ?1",
-            [&reference_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(internal_error)?
-    {
-        if existing.0 != id || existing.1 != request.delta {
-            return Err(AppError(StatusCode::CONFLICT, "请求流水号已被使用".into()));
+    write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT user_id, delta, balance_after FROM credit_ledger WHERE reference_id = ?1",
+                [&reference_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal_error)?
+        {
+            if existing.0 != id || existing.1 != request.delta {
+                return Err(AppError(StatusCode::CONFLICT, "请求流水号已被使用".into()));
+            }
+            return Ok(Json(api_success(json!({ "credits": existing.2 }))));
         }
-        return Ok(Json(api_success(json!({ "credits": existing.2 }))));
-    }
-    let (credits, reserved) = transaction
-        .query_row(
-            "SELECT credits, credits_reserved FROM users WHERE id = ?1",
-            [&id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(internal_error)?
-        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "用户不存在".into()))?;
-    let balance = credits
-        .checked_add(request.delta)
-        .filter(|value| *value >= reserved && *value >= 0)
-        .ok_or_else(|| AppError(StatusCode::CONFLICT, "积分余额不能低于已预扣积分".into()))?;
-    transaction
-        .execute(
-            "UPDATE users SET credits = ?1 WHERE id = ?2",
-            params![balance, id],
+        let (credits, reserved) = transaction
+            .query_row(
+                "SELECT credits, credits_reserved FROM users WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(internal_error)?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "用户不存在".into()))?;
+        let balance = credits
+            .checked_add(request.delta)
+            .filter(|value| *value >= reserved && *value >= 0)
+            .ok_or_else(|| AppError(StatusCode::CONFLICT, "积分余额不能低于已预扣积分".into()))?;
+        transaction
+            .execute(
+                "UPDATE users SET credits = ?1 WHERE id = ?2",
+                params![balance, id],
+            )
+            .map_err(internal_error)?;
+        transaction
+            .execute(
+                "INSERT INTO credit_ledger (
+                   id, user_id, delta, balance_after, reason, reference_id,
+                   operator_user_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    format!("credit-{}", Uuid::new_v4().simple()),
+                    id,
+                    request.delta,
+                    balance,
+                    reason,
+                    reference_id,
+                    admin.id,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(internal_error)?;
+        write_audit(
+            &transaction,
+            &admin.id,
+            "adjust_credits",
+            "user",
+            &id,
+            json!({ "delta": request.delta, "balance": balance, "reason": reason }),
         )
         .map_err(internal_error)?;
-    transaction
-        .execute(
-            "INSERT INTO credit_ledger (
-               id, user_id, delta, balance_after, reason, reference_id,
-               operator_user_id, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                format!("credit-{}", Uuid::new_v4().simple()),
-                id,
-                request.delta,
-                balance,
-                reason,
-                reference_id,
-                admin.id,
-                Utc::now().to_rfc3339()
-            ],
-        )
-        .map_err(internal_error)?;
-    write_audit(
-        &transaction,
-        &admin.id,
-        "adjust_credits",
-        "user",
-        &id,
-        json!({ "delta": request.delta, "balance": balance, "reason": reason }),
-    )
-    .map_err(internal_error)?;
-    transaction.commit().map_err(internal_error)?;
-    Ok(Json(api_success(json!({ "credits": balance }))))
+        transaction.commit().map_err(internal_error)?;
+        Ok(Json(api_success(json!({ "credits": balance }))))
+    })
 }
 
 #[derive(Deserialize)]
@@ -475,48 +492,49 @@ pub async fn list_credit_ledger(
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(30).clamp(1, 100);
     let user_id = query.user_id.unwrap_or_default();
-    let connection = database(&state.db)?;
-    let total = connection
-        .query_row(
-            "SELECT COUNT(*) FROM credit_ledger WHERE (?1 = '' OR user_id = ?1)",
-            [&user_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT l.id, l.user_id, u.email, l.delta, l.balance_after, l.reason,
+    read_database(&state.db, |connection| {
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*) FROM credit_ledger WHERE (?1 = '' OR user_id = ?1)",
+                [&user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT l.id, l.user_id, u.email, l.delta, l.balance_after, l.reason,
                     l.reference_id, l.created_at, operator.email
              FROM credit_ledger l
              JOIN users u ON u.id = l.user_id
              LEFT JOIN users operator ON operator.id = l.operator_user_id
              WHERE (?1 = '' OR l.user_id = ?1)
              ORDER BY l.created_at DESC LIMIT ?2 OFFSET ?3",
-        )
-        .map_err(internal_error)?;
-    let items = statement
-        .query_map(params![user_id, page_size, (page - 1) * page_size], |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "userId": row.get::<_, String>(1)?,
-                "userEmail": row.get::<_, String>(2)?,
-                "delta": row.get::<_, i64>(3)?,
-                "balanceAfter": row.get::<_, i64>(4)?,
-                "reason": row.get::<_, String>(5)?,
-                "referenceId": row.get::<_, String>(6)?,
-                "createdAt": row.get::<_, String>(7)?,
-                "operatorEmail": row.get::<_, Option<String>>(8)?
-            }))
-        })
-        .map_err(internal_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal_error)?;
-    Ok(Json(api_success(json!({
-        "items": items,
-        "total": total,
-        "page": page,
-        "pageSize": page_size
-    }))))
+            )
+            .map_err(internal_error)?;
+        let items = statement
+            .query_map(params![user_id, page_size, (page - 1) * page_size], |row| {
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "userId": row.get::<_, String>(1)?,
+                    "userEmail": row.get::<_, String>(2)?,
+                    "delta": row.get::<_, i64>(3)?,
+                    "balanceAfter": row.get::<_, i64>(4)?,
+                    "reason": row.get::<_, String>(5)?,
+                    "referenceId": row.get::<_, String>(6)?,
+                    "createdAt": row.get::<_, String>(7)?,
+                    "operatorEmail": row.get::<_, Option<String>>(8)?
+                }))
+            })
+            .map_err(internal_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        Ok(Json(api_success(json!({
+            "items": items,
+            "total": total,
+            "page": page,
+            "pageSize": page_size
+        }))))
+    })
 }
 
 #[derive(Deserialize)]
@@ -542,21 +560,21 @@ pub async fn list_usage_logs(
     if !status.is_empty() && !["success", "error"].contains(&status.as_str()) {
         return Err(AppError(StatusCode::BAD_REQUEST, "调用状态无效".into()));
     }
-    let connection = database(&state.db)?;
-    let total = connection
-        .query_row(
-            "SELECT COUNT(*)
+    read_database(&state.db, |connection| {
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*)
              FROM usage_logs l JOIN users u ON u.id = l.user_id
              WHERE (?1 = '' OR lower(u.email) LIKE ?2 OR lower(l.ip_address) LIKE ?2
                     OR lower(l.device_id) LIKE ?2 OR lower(l.endpoint) LIKE ?2)
                AND (?3 = '' OR l.status = ?3)",
-            params![search, pattern, status],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT l.id, l.user_id, u.email, COALESCE(p.name, ''), l.endpoint,
+                params![search, pattern, status],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT l.id, l.user_id, u.email, COALESCE(p.name, ''), l.endpoint,
                     l.model, l.status, l.duration_ms, l.credits_used,
                     l.ip_address, l.device_id, l.platform, l.app_version,
                     l.user_agent, l.created_at, i.id
@@ -572,44 +590,45 @@ pub async fn list_usage_logs(
                     OR lower(l.device_id) LIKE ?2 OR lower(l.endpoint) LIKE ?2)
                AND (?3 = '' OR l.status = ?3)
              ORDER BY l.created_at DESC LIMIT ?4 OFFSET ?5",
-        )
-        .map_err(internal_error)?;
-    let items = statement
-        .query_map(
-            params![search, pattern, status, page_size, (page - 1) * page_size],
-            |row| {
-                let image_url = row
-                    .get::<_, Option<String>>(15)?
-                    .map(|id| format!("/api/admin/images/{id}/file"));
-                Ok(json!({
-                    "id": row.get::<_, String>(0)?,
-                    "userId": row.get::<_, String>(1)?,
-                    "userEmail": row.get::<_, String>(2)?,
-                    "providerName": row.get::<_, String>(3)?,
-                    "endpoint": row.get::<_, String>(4)?,
-                    "model": row.get::<_, String>(5)?,
-                    "status": row.get::<_, String>(6)?,
-                    "durationMs": row.get::<_, i64>(7)?,
-                    "creditsUsed": row.get::<_, i64>(8)?,
-                    "ipAddress": row.get::<_, String>(9)?,
-                    "deviceId": row.get::<_, String>(10)?,
-                    "platform": row.get::<_, String>(11)?,
-                    "appVersion": row.get::<_, String>(12)?,
-                    "userAgent": row.get::<_, String>(13)?,
-                    "createdAt": row.get::<_, String>(14)?,
-                    "imageUrl": image_url
-                }))
-            },
-        )
-        .map_err(internal_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal_error)?;
-    Ok(Json(api_success(json!({
-        "items": items,
-        "total": total,
-        "page": page,
-        "pageSize": page_size
-    }))))
+            )
+            .map_err(internal_error)?;
+        let items = statement
+            .query_map(
+                params![search, pattern, status, page_size, (page - 1) * page_size],
+                |row| {
+                    let image_url = row
+                        .get::<_, Option<String>>(15)?
+                        .map(|id| format!("/api/admin/images/{id}/file"));
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "userId": row.get::<_, String>(1)?,
+                        "userEmail": row.get::<_, String>(2)?,
+                        "providerName": row.get::<_, String>(3)?,
+                        "endpoint": row.get::<_, String>(4)?,
+                        "model": row.get::<_, String>(5)?,
+                        "status": row.get::<_, String>(6)?,
+                        "durationMs": row.get::<_, i64>(7)?,
+                        "creditsUsed": row.get::<_, i64>(8)?,
+                        "ipAddress": row.get::<_, String>(9)?,
+                        "deviceId": row.get::<_, String>(10)?,
+                        "platform": row.get::<_, String>(11)?,
+                        "appVersion": row.get::<_, String>(12)?,
+                        "userAgent": row.get::<_, String>(13)?,
+                        "createdAt": row.get::<_, String>(14)?,
+                        "imageUrl": image_url
+                    }))
+                },
+            )
+            .map_err(internal_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        Ok(Json(api_success(json!({
+            "items": items,
+            "total": total,
+            "page": page,
+            "pageSize": page_size
+        }))))
+    })
 }
 
 pub async fn image_file(
@@ -618,37 +637,23 @@ pub async fn image_file(
     AxumPath(id): AxumPath<String>,
 ) -> AppResult<Response> {
     admin_user(&headers, &state)?;
-    let record = database(&state.db)?
-        .query_row(
-            "SELECT file_name, format, storage FROM images WHERE id = ?1",
-            [&id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(internal_error)?
-        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))?;
-    let bytes = fs::read(state.config.image_directory.join(record.0))
-        .await
-        .map_err(|_| AppError(StatusCode::NOT_FOUND, "图片文件不存在".into()))?;
-    let content_type = match record.1.as_str() {
-        "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        _ => "image/png",
-    };
-    Ok((
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "private, max-age=3600"),
-        ],
-        Body::from(bytes),
+    let record = read_database(&state.db, |connection| {
+        connection
+            .query_row("SELECT file_name FROM images WHERE id = ?1", [&id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(internal_error)?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "图片不存在".into()))
+    })?;
+    crate::images::serve_stored_file(
+        &headers,
+        state.config.image_directory.join(&record),
+        &record,
+        "private, max-age=0, must-revalidate",
+        "图片文件不存在",
     )
-        .into_response())
+    .await
 }
 
 #[derive(Deserialize)]
@@ -688,14 +693,16 @@ pub async fn ip_location(
         .parse::<IpAddr>()
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "IP 地址无效".into()))?
         .to_string();
-    let cached = database(&state.db)?
-        .query_row(
-            "SELECT location, isp FROM ip_locations WHERE ip = ?1",
-            [&ip],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(internal_error)?;
+    let cached = read_database(&state.db, |connection| {
+        connection
+            .query_row(
+                "SELECT location, isp FROM ip_locations WHERE ip = ?1",
+                [&ip],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(internal_error)
+    })?;
     if let Some((location, isp)) = cached {
         return Ok(Json(api_success(json!({
             "ip": ip,
@@ -750,17 +757,20 @@ pub async fn ip_location(
     }
     let location = parts.join(" · ");
     let isp = result.connection.map(|item| item.isp).unwrap_or_default();
-    database(&state.db)?
-        .execute(
-            "INSERT INTO ip_locations (ip, location, isp, updated_at)
+    write_database(&state.db, |connection| {
+        connection
+            .execute(
+                "INSERT INTO ip_locations (ip, location, isp, updated_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(ip) DO UPDATE SET
                location = excluded.location,
                isp = excluded.isp,
                updated_at = excluded.updated_at",
-            params![ip, location, isp, Utc::now().to_rfc3339()],
-        )
-        .map_err(internal_error)?;
+                params![ip, location, isp, Utc::now().to_rfc3339()],
+            )
+            .map_err(internal_error)?;
+        Ok(())
+    })?;
     Ok(Json(api_success(json!({
         "ip": ip,
         "location": location,
@@ -774,25 +784,35 @@ pub async fn get_settings(
     headers: HeaderMap,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     admin_user(&headers, &state)?;
-    let connection = database(&state.db)?;
-    let registration_credits = connection
-        .query_row(
-            "SELECT value FROM system_settings WHERE key = 'registration_credits'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    let default_daily_limit = connection
-        .query_row(
-            "SELECT value FROM system_settings WHERE key = 'default_daily_limit'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(internal_error)?;
-    Ok(Json(api_success(json!({
-        "registrationCredits": registration_credits,
-        "defaultDailyLimit": default_daily_limit
-    }))))
+    read_database(&state.db, |connection| {
+        let registration_credits = connection
+            .query_row(
+                "SELECT value FROM system_settings WHERE key = 'registration_credits'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        let default_daily_limit = connection
+            .query_row(
+                "SELECT value FROM system_settings WHERE key = 'default_daily_limit'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        // 仍以明文保存的历史 Key 数量，用于驱动退役进度（OPT-07）。
+        let legacy_api_keys = connection
+            .query_row(
+                "SELECT COUNT(*) FROM api_keys WHERE is_legacy = 1 AND status = 'active'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(internal_error)?;
+        Ok(Json(api_success(json!({
+            "registrationCredits": registration_credits,
+            "defaultDailyLimit": default_daily_limit,
+            "legacyApiKeys": legacy_api_keys
+        }))))
+    })
 }
 
 #[derive(Deserialize)]
@@ -800,6 +820,43 @@ pub async fn get_settings(
 pub struct UpdateSettingsRequest {
     registration_credits: i64,
     default_daily_limit: i64,
+}
+
+/// 批量吊销遗留的明文 API Key（OPT-07）。
+///
+/// `is_legacy = 1` 的 Key 在数据库中以明文保存，任何一次库泄露（含
+/// `data/backups/` 里的历史快照）都会直接暴露可用凭证。用户侧已有
+/// `needs_rotation` 提示，但没有强制期限，因此需要运营侧的兜底手段。
+pub async fn revoke_legacy_api_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let admin = admin_user(&headers, &state)?;
+    let revoked = write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let revoked = transaction
+            .execute(
+                "UPDATE api_keys SET status = 'revoked'
+                 WHERE is_legacy = 1 AND status = 'active'",
+                [],
+            )
+            .map_err(internal_error)?;
+        write_audit(
+            &transaction,
+            &admin.id,
+            "revoke_legacy_api_keys",
+            "api_keys",
+            "legacy",
+            json!({ "revoked": revoked }),
+        )
+        .map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        Ok(revoked)
+    })?;
+    tracing::warn!(revoked, admin = %admin.id, "legacy api keys revoked");
+    Ok(Json(api_success(json!({ "revoked": revoked }))))
 }
 
 pub async fn update_settings(
@@ -814,38 +871,40 @@ pub async fn update_settings(
     {
         return Err(AppError(StatusCode::BAD_REQUEST, "系统配置无效".into()));
     }
-    let mut connection = database(&state.db)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal_error)?;
-    let now = Utc::now().to_rfc3339();
-    transaction
-        .execute(
-            "UPDATE system_settings SET value = ?1, updated_at = ?2
+    write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let now = Utc::now().to_rfc3339();
+        transaction
+            .execute(
+                "UPDATE system_settings SET value = ?1, updated_at = ?2
              WHERE key = 'registration_credits'",
-            params![request.registration_credits, now],
-        )
-        .map_err(internal_error)?;
-    transaction
-        .execute(
-            "UPDATE system_settings SET value = ?1, updated_at = ?2
+                params![request.registration_credits, now],
+            )
+            .map_err(internal_error)?;
+        transaction
+            .execute(
+                "UPDATE system_settings SET value = ?1, updated_at = ?2
              WHERE key = 'default_daily_limit'",
-            params![request.default_daily_limit, now],
+                params![request.default_daily_limit, now],
+            )
+            .map_err(internal_error)?;
+        write_audit(
+            &transaction,
+            &admin.id,
+            "update_settings",
+            "system_settings",
+            "global",
+            json!({
+                "registrationCredits": request.registration_credits,
+                "defaultDailyLimit": request.default_daily_limit
+            }),
         )
         .map_err(internal_error)?;
-    write_audit(
-        &transaction,
-        &admin.id,
-        "update_settings",
-        "system_settings",
-        "global",
-        json!({
-            "registrationCredits": request.registration_credits,
-            "defaultDailyLimit": request.default_daily_limit
-        }),
-    )
-    .map_err(internal_error)?;
-    transaction.commit().map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        Ok(())
+    })?;
     Ok(Json(api_success(Value::Null)))
 }
 
@@ -854,34 +913,35 @@ pub async fn list_providers(
     headers: HeaderMap,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     admin_user(&headers, &state)?;
-    let connection = database(&state.db)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT id, name, base_url, key_prefix, key_suffix, model,
+    read_database(&state.db, |connection| {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, name, base_url, key_prefix, key_suffix, model,
                     is_active, created_at, encryption_version
              FROM providers WHERE is_global = 1
              ORDER BY is_active DESC, created_at DESC",
-        )
-        .map_err(internal_error)?;
-    let items = statement
-        .query_map([], |row| {
-            let prefix = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-            let suffix = row.get::<_, Option<String>>(4)?.unwrap_or_default();
-            Ok(ProviderResponse {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                base_url: row.get(2)?,
-                masked_api_key: mask_key(&prefix, &suffix),
-                model: row.get(5)?,
-                is_active: row.get(6)?,
-                created_at: row.get(7)?,
-                needs_rotation: row.get::<_, i64>(8)? == 0,
+            )
+            .map_err(internal_error)?;
+        let items = statement
+            .query_map([], |row| {
+                let prefix = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+                let suffix = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+                Ok(ProviderResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    base_url: row.get(2)?,
+                    masked_api_key: mask_key(&prefix, &suffix),
+                    model: row.get(5)?,
+                    is_active: row.get(6)?,
+                    created_at: row.get(7)?,
+                    needs_rotation: row.get::<_, i64>(8)? == 0,
+                })
             })
-        })
-        .map_err(internal_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal_error)?;
-    Ok(Json(api_success(json!({ "items": items }))))
+            .map_err(internal_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        Ok(Json(api_success(json!({ "items": items }))))
+    })
 }
 
 pub async fn create_provider(
@@ -901,40 +961,42 @@ pub async fn create_provider(
     let created_at = Utc::now().to_rfc3339();
     let encrypted = encrypt_secret(&state.config.master_key, api_key)?;
     let (prefix, suffix) = key_parts(api_key);
-    let mut connection = database(&state.db)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal_error)?;
-    let activate = transaction
-        .query_row(
-            "SELECT COUNT(*) = 0 FROM providers WHERE is_global = 1",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(internal_error)?;
-    transaction
-        .execute(
-            "INSERT INTO providers (
+    let activate = write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let activate = transaction
+            .query_row(
+                "SELECT COUNT(*) = 0 FROM providers WHERE is_global = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(internal_error)?;
+        transaction
+            .execute(
+                "INSERT INTO providers (
                id, user_id, name, base_url, api_key, api_key_cipher,
                key_prefix, key_suffix, encryption_version, model,
                is_active, is_global, created_at
              ) VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, 1, ?8, ?9, 1, ?10)",
-            params![
-                id, admin.id, name, base_url, encrypted, prefix, suffix, MODEL, activate,
-                created_at
-            ],
+                params![
+                    id, admin.id, name, base_url, encrypted, prefix, suffix, MODEL, activate,
+                    created_at
+                ],
+            )
+            .map_err(internal_error)?;
+        write_audit(
+            &transaction,
+            &admin.id,
+            "create_provider",
+            "provider",
+            &id,
+            json!({ "name": name, "baseUrl": base_url }),
         )
         .map_err(internal_error)?;
-    write_audit(
-        &transaction,
-        &admin.id,
-        "create_provider",
-        "provider",
-        &id,
-        json!({ "name": name, "baseUrl": base_url }),
-    )
-    .map_err(internal_error)?;
-    transaction.commit().map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        Ok(activate)
+    })?;
     Ok((
         StatusCode::CREATED,
         Json(api_success(ProviderResponse {
@@ -956,39 +1018,41 @@ pub async fn activate_provider(
     AxumPath(id): AxumPath<String>,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let admin = admin_user(&headers, &state)?;
-    let mut connection = database(&state.db)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal_error)?;
-    let exists = transaction
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM providers WHERE id = ?1 AND is_global = 1)",
-            [&id],
-            |row| row.get::<_, bool>(0),
+    write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM providers WHERE id = ?1 AND is_global = 1)",
+                [&id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(internal_error)?;
+        if !exists {
+            return Err(AppError(StatusCode::NOT_FOUND, "调用方不存在".into()));
+        }
+        transaction
+            .execute("UPDATE providers SET is_active = 0 WHERE is_global = 1", [])
+            .map_err(internal_error)?;
+        transaction
+            .execute(
+                "UPDATE providers SET is_active = 1 WHERE id = ?1 AND is_global = 1",
+                [&id],
+            )
+            .map_err(internal_error)?;
+        write_audit(
+            &transaction,
+            &admin.id,
+            "activate_provider",
+            "provider",
+            &id,
+            json!({}),
         )
         .map_err(internal_error)?;
-    if !exists {
-        return Err(AppError(StatusCode::NOT_FOUND, "调用方不存在".into()));
-    }
-    transaction
-        .execute("UPDATE providers SET is_active = 0 WHERE is_global = 1", [])
-        .map_err(internal_error)?;
-    transaction
-        .execute(
-            "UPDATE providers SET is_active = 1 WHERE id = ?1 AND is_global = 1",
-            [&id],
-        )
-        .map_err(internal_error)?;
-    write_audit(
-        &transaction,
-        &admin.id,
-        "activate_provider",
-        "provider",
-        &id,
-        json!({}),
-    )
-    .map_err(internal_error)?;
-    transaction.commit().map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        Ok(())
+    })?;
     Ok(Json(api_success(Value::Null)))
 }
 
@@ -998,46 +1062,48 @@ pub async fn delete_provider(
     AxumPath(id): AxumPath<String>,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let admin = admin_user(&headers, &state)?;
-    let mut connection = database(&state.db)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal_error)?;
-    let was_active = transaction
-        .query_row(
-            "SELECT is_active FROM providers WHERE id = ?1 AND is_global = 1",
-            [&id],
-            |row| row.get::<_, bool>(0),
-        )
-        .optional()
-        .map_err(internal_error)?
-        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "调用方不存在".into()))?;
-    transaction
-        .execute(
-            "DELETE FROM providers WHERE id = ?1 AND is_global = 1",
-            [&id],
-        )
-        .map_err(internal_error)?;
-    if was_active {
+    write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let was_active = transaction
+            .query_row(
+                "SELECT is_active FROM providers WHERE id = ?1 AND is_global = 1",
+                [&id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(internal_error)?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "调用方不存在".into()))?;
         transaction
             .execute(
-                "UPDATE providers SET is_active = 1 WHERE id = (
-                   SELECT id FROM providers WHERE is_global = 1
-                   ORDER BY created_at DESC LIMIT 1
-                 )",
-                [],
+                "DELETE FROM providers WHERE id = ?1 AND is_global = 1",
+                [&id],
             )
             .map_err(internal_error)?;
-    }
-    write_audit(
-        &transaction,
-        &admin.id,
-        "delete_provider",
-        "provider",
-        &id,
-        json!({}),
-    )
-    .map_err(internal_error)?;
-    transaction.commit().map_err(internal_error)?;
+        if was_active {
+            transaction
+                .execute(
+                    "UPDATE providers SET is_active = 1 WHERE id = (
+                       SELECT id FROM providers WHERE is_global = 1
+                       ORDER BY created_at DESC LIMIT 1
+                     )",
+                    [],
+                )
+                .map_err(internal_error)?;
+        }
+        write_audit(
+            &transaction,
+            &admin.id,
+            "delete_provider",
+            "provider",
+            &id,
+            json!({}),
+        )
+        .map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        Ok(())
+    })?;
     Ok(Json(api_success(Value::Null)))
 }
 
@@ -1076,30 +1142,32 @@ pub async fn create_announcement(
     let date = request
         .date
         .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
-    let connection = database(&state.db)?;
-    connection
-        .execute(
-            "INSERT INTO announcements (id, title, content, date, type, is_new)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                id,
-                request.title.trim(),
-                request.content.trim(),
-                date,
-                request.r#type,
-                request.is_new.unwrap_or(true)
-            ],
+    write_database(&state.db, |connection| {
+        connection
+            .execute(
+                "INSERT INTO announcements (id, title, content, date, type, is_new)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    request.title.trim(),
+                    request.content.trim(),
+                    date,
+                    request.r#type,
+                    request.is_new.unwrap_or(true)
+                ],
+            )
+            .map_err(internal_error)?;
+        write_audit(
+            connection,
+            &admin.id,
+            "create_announcement",
+            "announcement",
+            &id,
+            json!({ "title": request.title.trim() }),
         )
         .map_err(internal_error)?;
-    write_audit(
-        &connection,
-        &admin.id,
-        "create_announcement",
-        "announcement",
-        &id,
-        json!({ "title": request.title.trim() }),
-    )
-    .map_err(internal_error)?;
+        Ok(())
+    })?;
     Ok((StatusCode::CREATED, Json(api_success(json!({ "id": id })))))
 }
 
@@ -1115,34 +1183,36 @@ pub async fn update_announcement(
     let date = request
         .date
         .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
-    let connection = database(&state.db)?;
-    let changed = connection
-        .execute(
-            "UPDATE announcements
-             SET title = ?1, content = ?2, date = ?3, type = ?4, is_new = ?5
-             WHERE id = ?6",
-            params![
-                request.title.trim(),
-                request.content.trim(),
-                date,
-                request.r#type,
-                request.is_new.unwrap_or(true),
-                id
-            ],
+    write_database(&state.db, |connection| {
+        let changed = connection
+            .execute(
+                "UPDATE announcements
+                 SET title = ?1, content = ?2, date = ?3, type = ?4, is_new = ?5
+                 WHERE id = ?6",
+                params![
+                    request.title.trim(),
+                    request.content.trim(),
+                    date,
+                    request.r#type,
+                    request.is_new.unwrap_or(true),
+                    id
+                ],
+            )
+            .map_err(internal_error)?;
+        if changed == 0 {
+            return Err(AppError(StatusCode::NOT_FOUND, "公告不存在".into()));
+        }
+        write_audit(
+            connection,
+            &admin.id,
+            "update_announcement",
+            "announcement",
+            &id,
+            json!({ "title": request.title.trim() }),
         )
         .map_err(internal_error)?;
-    if changed == 0 {
-        return Err(AppError(StatusCode::NOT_FOUND, "公告不存在".into()));
-    }
-    write_audit(
-        &connection,
-        &admin.id,
-        "update_announcement",
-        "announcement",
-        &id,
-        json!({ "title": request.title.trim() }),
-    )
-    .map_err(internal_error)?;
+        Ok(())
+    })?;
     Ok(Json(api_success(Value::Null)))
 }
 
@@ -1152,21 +1222,228 @@ pub async fn delete_announcement(
     AxumPath(id): AxumPath<String>,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let admin = admin_user(&headers, &state)?;
-    let connection = database(&state.db)?;
-    let changed = connection
-        .execute("DELETE FROM announcements WHERE id = ?1", [&id])
+    write_database(&state.db, |connection| {
+        let changed = connection
+            .execute("DELETE FROM announcements WHERE id = ?1", [&id])
+            .map_err(internal_error)?;
+        if changed == 0 {
+            return Err(AppError(StatusCode::NOT_FOUND, "公告不存在".into()));
+        }
+        write_audit(
+            connection,
+            &admin.id,
+            "delete_announcement",
+            "announcement",
+            &id,
+            json!({}),
+        )
         .map_err(internal_error)?;
-    if changed == 0 {
-        return Err(AppError(StatusCode::NOT_FOUND, "公告不存在".into()));
-    }
-    write_audit(
-        &connection,
-        &admin.id,
-        "delete_announcement",
-        "announcement",
-        &id,
-        json!({}),
-    )
-    .map_err(internal_error)?;
+        Ok(())
+    })?;
     Ok(Json(api_success(Value::Null)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::Config,
+        db::{database, open_database},
+        presence::PresenceThrottle,
+    };
+    use axum::http::{header, HeaderValue};
+    use reqwest::Client;
+    use std::{fs as std_fs, sync::Arc};
+    use tempfile::TempDir;
+    use tokio::sync::Semaphore;
+
+    fn test_state() -> (TempDir, AppState) {
+        let directory = tempfile::tempdir().unwrap();
+        let image_directory = directory.path().join("images");
+        let task_directory = directory.path().join("tasks");
+        std_fs::create_dir_all(&image_directory).unwrap();
+        std_fs::create_dir_all(&task_directory).unwrap();
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_directory: directory.path().to_path_buf(),
+            image_directory,
+            task_directory,
+            static_directory: directory.path().join("static"),
+            production: false,
+            master_key: [4_u8; 32],
+            worker_concurrency: 1,
+            support_email: None,
+            support_wechat: None,
+            retention_dry_run: true,
+            usage_retention_days: 90,
+            task_retention_days: 7,
+            ip_location_retention_days: 30,
+            audit_retention_days: 365,
+            backup_retention_count: 5,
+            metrics_token_hash: None,
+        };
+        let state = AppState {
+            db: open_database(directory.path(), &[5_u8; 32]).unwrap(),
+            client: Client::new(),
+            config,
+            task_semaphore: Arc::new(Semaphore::new(1)),
+            presence: PresenceThrottle::new(),
+        };
+        let now = Utc::now().to_rfc3339();
+        let connection = database(&state.db).unwrap();
+        connection
+            .execute(
+                "INSERT INTO users (
+                   id, name, email, password_hash, avatar, plan, credits,
+                   credits_reserved, daily_limit, status, is_admin, created_at
+                 ) VALUES ('admin-1', 'Admin', 'admin@example.test', 'hash', '', 'Free',
+                           0, 0, 100, 'active', 1, ?1)",
+                [&now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('admin-session', 'admin-1', ?1, '2099-01-01T00:00:00Z')",
+                [&now],
+            )
+            .unwrap();
+        for (id, legacy, status) in [
+            ("key-legacy-active", 1, "active"),
+            ("key-legacy-revoked", 1, "revoked"),
+            ("key-hashed-active", 0, "active"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO api_keys (
+                       id, user_id, name, key_value, is_legacy, scope, status,
+                       created_at, last_used
+                     ) VALUES (?1, 'admin-1', ?1, ?1, ?2, 'full', ?3, ?4, '未调用')",
+                    params![id, legacy, status, now],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        (directory, state)
+    }
+
+    fn admin_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("lumora_session=admin-session"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn revokes_only_active_legacy_api_keys() {
+        let (_directory, state) = test_state();
+
+        let response = revoke_legacy_api_keys(State(state.clone()), admin_headers())
+            .await
+            .unwrap();
+        assert_eq!(response.0.data["revoked"], 1);
+
+        let statuses = |id: &str| -> String {
+            database(&state.db)
+                .unwrap()
+                .query_row("SELECT status FROM api_keys WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(statuses("key-legacy-active"), "revoked");
+        assert_eq!(statuses("key-legacy-revoked"), "revoked");
+        // 哈希存储的 Key 不受影响
+        assert_eq!(statuses("key-hashed-active"), "active");
+
+        // 操作写入审计日志
+        let audited = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM admin_audit_logs WHERE action = 'revoke_legacy_api_keys'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 1);
+
+        // 再次执行是幂等的：已无活跃遗留 Key
+        let again = revoke_legacy_api_keys(State(state.clone()), admin_headers())
+            .await
+            .unwrap();
+        assert_eq!(again.0.data["revoked"], 0);
+    }
+
+    #[tokio::test]
+    async fn reports_legacy_key_exposure_in_settings() {
+        let (_directory, state) = test_state();
+        let settings = get_settings(State(state.clone()), admin_headers())
+            .await
+            .unwrap();
+        assert_eq!(settings.0.data["legacyApiKeys"], 1);
+    }
+
+    #[tokio::test]
+    async fn includes_retained_usage_summaries_in_all_time_totals() {
+        let (_directory, state) = test_state();
+        {
+            let connection = database(&state.db).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO usage_logs (
+                       id, user_id, endpoint, model, status, duration_ms, credits_used, created_at
+                     ) VALUES ('usage-live', 'admin-1', '/v1/images/generations', 'test',
+                               'success', 10, 2, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO usage_daily_summary (
+                       summary_date, user_id, provider_id, endpoint, model, status,
+                       request_count, total_duration_ms, total_credits_used
+                     ) VALUES ('2025-01-01', 'admin-1', '', '/v1/images/generations', 'test',
+                               'success', 2, 30, 4)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let overview = overview(State(state.clone()), admin_headers())
+            .await
+            .unwrap();
+        assert_eq!(overview.0.data["totalCalls"], 3);
+        assert_eq!(overview.0.data["creditsUsed"], 6);
+        assert_eq!(overview.0.data["successRate"], 100.0);
+
+        let users = list_users(
+            State(state),
+            admin_headers(),
+            Query(UserQuery {
+                page: Some(1),
+                page_size: Some(20),
+                q: None,
+                status: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(users.0.data["items"][0]["totalCalls"], 3);
+        assert_eq!(users.0.data["items"][0]["creditsUsed"], 6);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_admin_callers() {
+        let (_directory, state) = test_state();
+        database(&state.db)
+            .unwrap()
+            .execute("UPDATE users SET is_admin = 0 WHERE id = 'admin-1'", [])
+            .unwrap();
+        match revoke_legacy_api_keys(State(state), admin_headers()).await {
+            Err(error) => assert_eq!(error.0, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("非管理员账号仍能吊销遗留 Key"),
+        }
+    }
 }

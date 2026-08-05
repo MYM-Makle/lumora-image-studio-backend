@@ -10,6 +10,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct Config {
@@ -23,6 +24,13 @@ pub struct Config {
     pub worker_concurrency: usize,
     pub support_email: Option<String>,
     pub support_wechat: Option<String>,
+    pub retention_dry_run: bool,
+    pub usage_retention_days: i64,
+    pub task_retention_days: i64,
+    pub ip_location_retention_days: i64,
+    pub audit_retention_days: i64,
+    pub backup_retention_count: usize,
+    pub metrics_token_hash: Option<[u8; 32]>,
 }
 
 impl Config {
@@ -105,8 +113,83 @@ impl Config {
             worker_concurrency,
             support_email: non_empty_env("LUMORA_SUPPORT_EMAIL"),
             support_wechat: non_empty_env("LUMORA_SUPPORT_WECHAT"),
+            retention_dry_run: boolean_env("LUMORA_RETENTION_DRY_RUN", true),
+            usage_retention_days: bounded_i64_env("LUMORA_USAGE_RETENTION_DAYS", 90),
+            task_retention_days: bounded_i64_env("LUMORA_TASK_RETENTION_DAYS", 7),
+            ip_location_retention_days: bounded_i64_env("LUMORA_IP_LOCATION_RETENTION_DAYS", 30),
+            audit_retention_days: bounded_i64_env("LUMORA_AUDIT_RETENTION_DAYS", 365),
+            backup_retention_count: bounded_usize_env("LUMORA_BACKUP_RETENTION_COUNT", 5),
+            // 仅保留摘要，避免长生命周期 Config 在内存中复制指标访问令牌明文。
+            metrics_token_hash: non_empty_env("LUMORA_METRICS_TOKEN")
+                .map(|value| Sha256::digest(value.as_bytes()).into()),
         })
     }
+}
+
+fn boolean_env(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn bounded_i64_env(name: &str, default: i64) -> i64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| (1..=36_500).contains(value))
+        .unwrap_or(default)
+}
+
+fn bounded_usize_env(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or(default)
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn load_master_key(
+    data_directory: &std::path::Path,
+    production: bool,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let encoded = match env::var("LUMORA_MASTER_KEY") {
+        Ok(value) => value,
+        Err(_) if production => {
+            return Err("production requires LUMORA_MASTER_KEY (base64-encoded 32 bytes)".into())
+        }
+        Err(_) => {
+            let path = data_directory.join("master.key");
+            if path.exists() {
+                fs::read_to_string(path)?.trim().to_string()
+            } else {
+                let mut bytes = [0_u8; 32];
+                OsRng.fill_bytes(&mut bytes);
+                let encoded = BASE64.encode(bytes);
+                let mut file = fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path)?;
+                file.write_all(encoded.as_bytes())?;
+                encoded
+            }
+        }
+    };
+    let decoded = BASE64.decode(encoded)?;
+    decoded
+        .try_into()
+        .map_err(|_| "LUMORA_MASTER_KEY must decode to exactly 32 bytes".into())
 }
 
 #[cfg(test)]
@@ -147,43 +230,4 @@ mod tests {
         assert!(!config.data_directory.join("master.key").exists());
         Ok(())
     }
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn load_master_key(
-    data_directory: &std::path::Path,
-    production: bool,
-) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let encoded = match env::var("LUMORA_MASTER_KEY") {
-        Ok(value) => value,
-        Err(_) if production => {
-            return Err("production requires LUMORA_MASTER_KEY (base64-encoded 32 bytes)".into())
-        }
-        Err(_) => {
-            let path = data_directory.join("master.key");
-            if path.exists() {
-                fs::read_to_string(path)?.trim().to_string()
-            } else {
-                let mut bytes = [0_u8; 32];
-                OsRng.fill_bytes(&mut bytes);
-                let encoded = BASE64.encode(bytes);
-                let mut file = fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(path)?;
-                file.write_all(encoded.as_bytes())?;
-                encoded
-            }
-        }
-    };
-    let decoded = BASE64.decode(encoded)?;
-    decoded
-        .try_into()
-        .map_err(|_| "LUMORA_MASTER_KEY must decode to exactly 32 bytes".into())
 }

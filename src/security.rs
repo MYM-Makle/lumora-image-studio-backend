@@ -53,24 +53,6 @@ pub fn mask_key(prefix: &str, suffix: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encrypts_and_hashes_credentials() {
-        let key = [9_u8; 32];
-        let encrypted = encrypt_secret(&key, "test-secret").unwrap();
-        assert_ne!(encrypted, "test-secret");
-        assert_eq!(decrypt_secret(&key, &encrypted).unwrap(), "test-secret");
-        assert_eq!(hash_api_key("same"), hash_api_key("same"));
-        assert_ne!(hash_api_key("same"), hash_api_key("different"));
-        let (prefix, suffix) = key_parts("test-key");
-        assert_eq!((prefix.as_str(), suffix.as_str()), ("te", "ey"));
-        assert!(!mask_key(&prefix, &suffix).contains("test-key"));
-    }
-}
-
 pub fn key_parts(value: &str) -> (String, String) {
     let chars = value.chars().collect::<Vec<_>>();
     let (prefix_length, suffix_length) = if chars.len() > 13 {
@@ -88,4 +70,22 @@ pub fn key_parts(value: &str) -> (String, String) {
         .rev()
         .collect::<String>();
     (prefix, suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypts_and_hashes_credentials() {
+        let key = [9_u8; 32];
+        let encrypted = encrypt_secret(&key, "test-secret").unwrap();
+        assert_ne!(encrypted, "test-secret");
+        assert_eq!(decrypt_secret(&key, &encrypted).unwrap(), "test-secret");
+        assert_eq!(hash_api_key("same"), hash_api_key("same"));
+        assert_ne!(hash_api_key("same"), hash_api_key("different"));
+        let (prefix, suffix) = key_parts("test-key");
+        assert_eq!((prefix.as_str(), suffix.as_str()), ("te", "ey"));
+        assert!(!mask_key(&prefix, &suffix).contains("test-key"));
+    }
 }

@@ -5,6 +5,10 @@ mod config;
 mod db;
 mod images;
 mod model;
+mod observability;
+mod presence;
+mod request;
+mod retention;
 mod security;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -12,20 +16,22 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderName, HeaderValue, Method},
+    middleware,
     routing::{any, delete, get, post, put},
     Router,
 };
 use reqwest::Client;
 use tokio::sync::Semaphore;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::{
+    compression::CompressionLayer,
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
-    trace::TraceLayer,
 };
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use config::Config;
 use db::{open_database, Database};
+use presence::PresenceThrottle;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,19 +39,14 @@ pub struct AppState {
     client: Client,
     config: Config,
     task_semaphore: Arc<Semaphore>,
+    presence: PresenceThrottle,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "lumora_server=info,tower_http=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let config = Config::load()?;
+    observability::init_tracing(config.production);
+    observability::install_metrics()?;
     let db = open_database(&config.data_directory, &config.master_key)?;
     let state = AppState {
         db,
@@ -53,9 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .timeout(Duration::from_secs(360))
             .build()?,
         task_semaphore: Arc::new(Semaphore::new(config.worker_concurrency)),
+        presence: PresenceThrottle::new(),
         config: config.clone(),
     };
     images::recover_tasks(&state)?;
+    retention::spawn_daily(state.clone());
 
     let static_service = ServeDir::new(&config.static_directory)
         .fallback(ServeFile::new(config.static_directory.join("index.html")));
@@ -79,10 +82,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             HeaderName::from_static("x-lumora-app-version"),
             HeaderName::from_static("x-lumora-client"),
         ])
+        .expose_headers([request::REQUEST_ID_HEADER.clone()])
         .allow_credentials(true);
-    let app = Router::new()
-        .route("/healthz", get(account::liveness))
-        .route("/api/health", get(account::health))
+    let mut global_rate_builder = GovernorConfigBuilder::default();
+    global_rate_builder.per_millisecond(500).burst_size(120);
+    let mut global_rate_builder = global_rate_builder
+        .key_extractor(request::TrustedClientIpKeyExtractor)
+        .use_headers();
+    let global_rate = global_rate_builder
+        .finish()
+        .expect("global rate limit configuration is valid");
+
+    let mut write_rate_builder = GovernorConfigBuilder::default();
+    write_rate_builder
+        .per_second(2)
+        .burst_size(30)
+        .methods(vec![Method::POST, Method::PUT, Method::DELETE]);
+    let mut write_rate_builder = write_rate_builder
+        .key_extractor(request::TrustedClientIpKeyExtractor)
+        .use_headers();
+    let write_rate = write_rate_builder
+        .finish()
+        .expect("write rate limit configuration is valid");
+
+    let global_limiter = global_rate.limiter().clone();
+    let write_limiter = write_rate.limiter().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            global_limiter.retain_recent();
+            write_limiter.retain_recent();
+        }
+    });
+
+    let api_routes = Router::new()
         .route("/api/config/public", get(account::public_config))
         .route("/api/stats", get(account::public_stats))
         .route("/api/session", get(auth::session))
@@ -156,6 +190,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(admin::get_settings).put(admin::update_settings),
         )
         .route(
+            "/api/admin/api-keys/revoke-legacy",
+            post(admin::revoke_legacy_api_keys),
+        )
+        .route(
             "/api/admin/providers",
             get(admin::list_providers).post(admin::create_provider),
         )
@@ -169,6 +207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/admin/announcements/{id}",
             put(admin::update_announcement).delete(admin::delete_announcement),
         )
+        .route("/api/{*path}", any(account::api_not_found))
+        .layer(middleware::from_fn(request::require_first_party_request));
+    let external_routes = Router::new()
         .route("/v1/images/generations", post(images::external_generate))
         .route("/v1/images/edits", post(images::external_edit))
         .route(
@@ -179,12 +220,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks/{ids}", get(images::get_tasks))
         .route("/v1/tasks/confirm", post(images::confirm_tasks))
         .route("/v1/account/credits", get(account::external_credits))
-        .route("/v1/account/usage", get(account::external_usage))
-        .route("/api/{*path}", any(account::api_not_found))
+        .route("/v1/account/usage", get(account::external_usage));
+    let limited_routes = api_routes
+        .merge(external_routes)
+        .layer(GovernorLayer::new(Arc::new(write_rate)).error_handler(request::rate_limit_response))
+        .layer(
+            GovernorLayer::new(Arc::new(global_rate)).error_handler(request::rate_limit_response),
+        );
+    let app = Router::new()
+        .route("/healthz", get(account::liveness))
+        .route("/api/health", get(account::health))
+        .route("/metrics", get(observability::metrics))
+        .merge(limited_routes)
         .fallback_service(static_service)
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
+        .layer(CompressionLayer::new())
         .layer(cors)
+        .layer(middleware::from_fn(request::observe_request))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
