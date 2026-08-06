@@ -1664,16 +1664,18 @@ mod tests {
             .unwrap();
         assert_eq!(response.0.data["updated"], 2);
 
-        let connection = database(&state.db).unwrap();
-        let balances = connection
-            .prepare("SELECT credits FROM users WHERE id IN ('user-2', 'user-3') ORDER BY id")
-            .unwrap()
-            .query_map([], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let balances = {
+            let connection = database(&state.db).unwrap();
+            let mut statement = connection
+                .prepare("SELECT credits FROM users WHERE id IN ('user-2', 'user-3') ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
         assert_eq!(balances, vec![80, 80]);
-        drop(connection);
 
         let repeated = bulk_set_credits(State(state.clone()), admin_headers(), request())
             .await
