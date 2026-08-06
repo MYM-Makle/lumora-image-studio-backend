@@ -137,6 +137,7 @@ pub struct UserResponse {
 pub struct ImageResponse {
     pub id: String,
     pub url: String,
+    pub thumbnail_url: String,
     pub prompt: String,
     pub size: String,
     pub model: String,

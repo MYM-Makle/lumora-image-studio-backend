@@ -7,7 +7,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,8 +28,9 @@ use crate::{
 
 mod files;
 pub(crate) use files::{
-    private_image_file, private_image_reference_file, private_task_reference_file,
-    public_image_file, serve_stored_file,
+    private_image_file, private_image_reference_file, private_image_thumbnail,
+    private_task_reference_file, public_image_file, public_image_thumbnail, serve_stored_file,
+    thumbnail_file_name,
 };
 mod credits;
 use credits::{record_generation_metrics, reserve_credits, settle_failure};
@@ -43,8 +44,8 @@ use upstream::{request_upstream_edit, request_upstream_generation};
 mod storage;
 use storage::{store_outputs, GeneratedOutput, StoreContext};
 mod tasks;
-use tasks::create_tasks;
 pub(crate) use tasks::recover_tasks;
+use tasks::{create_tasks, retry_task};
 
 struct GenerationResult {
     images: Vec<ImageResponse>,
@@ -76,6 +77,13 @@ pub struct GalleryQuery {
     page_size: Option<u32>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageListQuery {
+    page: Option<u32>,
+    page_size: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct TaskPayload {
     generation: GenerateRequest,
@@ -102,27 +110,45 @@ use crate::request::{ensure_first_party_client, header_text};
 pub async fn list_images(
     State(state): State<AppState>,
     headers: HeaderMap,
+    query: Result<Query<ImageListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> AppResult<Json<ApiResponse<Value>>> {
+    let query = api_query(query)?;
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(30).clamp(1, 50);
     let user = user_from_headers(&headers, &state)?;
     let device_id = header_text(&headers, "x-lumora-device-id", 128).unwrap_or_default();
     read_database(&state.db, |connection| {
+        let total: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM images
+                 WHERE user_id = ?1 AND (storage = 'server' OR device_id = ?2)",
+                params![user.id, device_id],
+                |row| row.get(0),
+            )
+            .map_err(internal_error)?;
         let mut statement = connection
             .prepare(
                 "SELECT id, prompt, size, model, created_at, format, visibility, category,
                     storage, reference_files
              FROM images
              WHERE user_id = ?1 AND (storage = 'server' OR device_id = ?2)
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC LIMIT ?3 OFFSET ?4",
             )
             .map_err(internal_error)?;
         let items = statement
-            .query_map(params![user.id, device_id], |row| {
-                image_from_row(row, false, None)
-            })
+            .query_map(
+                params![user.id, device_id, page_size, (page - 1) * page_size],
+                |row| image_from_row(row, false, None),
+            )
             .map_err(internal_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_error)?;
-        Ok(Json(api_success(json!({ "items": items }))))
+        Ok(Json(api_success(json!({
+            "items": items,
+            "total": total,
+            "page": page,
+            "pageSize": page_size
+        }))))
     })
 }
 
@@ -402,6 +428,11 @@ fn image_from_row(
             format!("/public/images/{id}")
         } else {
             format!("/api/images/{id}/file")
+        },
+        thumbnail_url: if public {
+            format!("/public/images/{id}/thumbnail")
+        } else {
+            format!("/api/images/{id}/thumbnail")
         },
         id,
         prompt: row.get(1)?,
@@ -797,6 +828,7 @@ pub async fn delete_image(
     })?;
     let mut file_names = serde_json::from_str::<Vec<String>>(&record.1).unwrap_or_default();
     file_names.push(record.0);
+    file_names.push(thumbnail_file_name(&id));
     let mut moved = Vec::new();
     for file_name in file_names {
         let original = state.config.image_directory.join(file_name);
@@ -836,20 +868,25 @@ pub async fn clear_images(
     let file_names = read_database(&state.db, |connection| {
         let mut statement = connection
             .prepare(
-                "SELECT file_name, reference_files
+                "SELECT id, file_name, reference_files
                  FROM images WHERE user_id = ?1",
             )
             .map_err(internal_error)?;
         let records = statement
             .query_map([&user.id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(internal_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_error)?;
         let mut file_names = Vec::new();
-        for (file_name, reference_files) in records {
+        for (id, file_name, reference_files) in records {
             file_names.push(file_name);
+            file_names.push(thumbnail_file_name(&id));
             file_names
                 .extend(serde_json::from_str::<Vec<String>>(&reference_files).unwrap_or_default());
         }
@@ -950,16 +987,23 @@ pub async fn list_active_image_tasks(
     headers: HeaderMap,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let user = user_from_headers(&headers, &state)?;
+    let error_cutoff = (Utc::now() - Duration::days(state.config.task_retention_days)).to_rfc3339();
     let ids = read_database(&state.db, |connection| {
         let mut statement = connection
             .prepare(
                 "SELECT id FROM tasks
-                 WHERE user_id = ?1 AND status IN ('queued', 'running')
-                 ORDER BY created_at",
+                 WHERE user_id = ?1 AND (
+                   status IN ('queued', 'running') OR (status = 'error' AND updated_at >= ?2)
+                 )
+                 ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+                          created_at DESC
+                 LIMIT 50",
             )
             .map_err(internal_error)?;
         let ids = statement
-            .query_map([&user.id], |row| row.get::<_, String>(0))
+            .query_map(params![user.id, error_cutoff], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(internal_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_error)?;
@@ -968,6 +1012,23 @@ pub async fn list_active_image_tasks(
     Ok(Json(api_success(json!({
         "items": task_summaries(&state, &user.id, &ids)?
     }))))
+}
+
+pub async fn retry_image_task(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    let user = user_from_headers(&headers, &state)?;
+    active_provider(&state, &user.id)?;
+    let metadata = request_metadata(&headers, peer_addr);
+    let task_ids = retry_task(&state, &user, &id, metadata).await?;
+    let items = task_summaries(&state, &user.id, &task_ids)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(api_success(json!({ "items": items }))),
+    ))
 }
 
 pub async fn get_image_tasks(
@@ -988,23 +1049,25 @@ fn task_summaries(state: &AppState, user_id: &str, ids: &[String]) -> AppResult<
         for id in ids {
             let record = connection
                 .query_row(
-                    "SELECT status, image_id, error, request_json, created_at, updated_at
+                    "SELECT kind, status, image_id, error, request_json, created_at, updated_at
                  FROM tasks WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(1)?,
                             row.get::<_, Option<String>>(2)?,
-                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(3)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(internal_error)?;
-            let Some((status, image_id, error, request_json, created_at, updated_at)) = record
+            let Some((kind, status, image_id, error, request_json, created_at, updated_at)) =
+                record
             else {
                 continue;
             };
@@ -1019,7 +1082,10 @@ fn task_summaries(state: &AppState, user_id: &str, ids: &[String]) -> AppResult<
             items.push(json!({
                 "id": id,
                 "status": status,
+                "kind": kind,
                 "prompt": payload.generation.prompt,
+                "size": payload.generation.size,
+                "isPublic": payload.generation.is_public,
                 "referenceImages": reference_images,
                 "imageId": image_id,
                 "error": error,
@@ -1559,7 +1625,11 @@ mod tests {
                 params![user.id, now],
             )
             .unwrap();
-        for (id, status) in [("task-active", "running"), ("task-done", "success")] {
+        for (id, status) in [
+            ("task-active", "running"),
+            ("task-failed", "error"),
+            ("task-done", "success"),
+        ] {
             connection
                 .execute(
                     "INSERT INTO tasks (
@@ -1594,14 +1664,17 @@ mod tests {
         assert_eq!(active["code"], 0);
         assert_eq!(active["message"], "success");
         assert!(active["timestamp"].as_i64().is_some());
-        assert_eq!(active["data"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(active["data"]["items"].as_array().unwrap().len(), 2);
         assert_eq!(active["data"]["items"][0]["id"], "task-active");
         assert_eq!(active["data"]["items"][0]["prompt"], "A test image");
+        assert_eq!(active["data"]["items"][0]["kind"], "generation");
+        assert_eq!(active["data"]["items"][0]["size"], "1024x1024");
         assert_eq!(
             active["data"]["items"][0]["referenceImages"][0],
             "/api/image-tasks/task-active/references/0"
         );
         assert_eq!(active["data"]["items"][0]["createdAt"], now);
+        assert_eq!(active["data"]["items"][1]["id"], "task-failed");
 
         let requested_response = app
             .oneshot(
@@ -1622,6 +1695,54 @@ mod tests {
         .unwrap();
         assert_eq!(requested["data"]["items"].as_array().unwrap().len(), 2);
         assert_eq!(requested["data"]["items"][1]["status"], "success");
+    }
+
+    #[tokio::test]
+    async fn retries_failed_generation_as_a_new_task() {
+        let (_directory, state, user) = test_state(3).await;
+        state.task_semaphore.close();
+        let now = Utc::now().to_rfc3339();
+        let payload = serde_json::to_string(&TaskPayload {
+            generation: generation_request(1),
+            input_files: Vec::new(),
+            mask_file: None,
+            request_metadata: RequestMetadata::default(),
+        })
+        .unwrap();
+        database(&state.db)
+            .unwrap()
+            .execute(
+                "INSERT INTO tasks (
+                   id, user_id, kind, status, request_json, credits_reserved,
+                   credits_used, created_at, updated_at
+                 ) VALUES ('task-failed', ?1, 'generation', 'error', ?2, 1, 0, ?3, ?3)",
+                params![user.id, payload, now],
+            )
+            .unwrap();
+
+        let retried = tasks::retry_task(&state, &user, "task-failed", RequestMetadata::default())
+            .await
+            .unwrap();
+
+        assert_eq!(retried.len(), 1);
+        assert_ne!(retried[0], "task-failed");
+        let connection = database(&state.db).unwrap();
+        let old_status: String = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'task-failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let new_status: String = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [&retried[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_status, "error");
+        assert_eq!(new_status, "queued");
     }
 
     #[tokio::test]

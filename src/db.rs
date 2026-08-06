@@ -10,12 +10,13 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags, MAIN_DB};
 
 use crate::{
+    classification::{classify_prompt, CATEGORY_VERSION},
     model::{AppError, AppResult},
     security::{encrypt_secret, key_parts},
 };
 use axum::http::StatusCode;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const MIN_READERS: usize = 2;
 const MAX_READERS: usize = 8;
 
@@ -489,6 +490,12 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
     add_column(
         connection,
         "images",
+        "category_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column(
+        connection,
+        "images",
         "storage",
         "TEXT NOT NULL DEFAULT 'server'",
     )?;
@@ -580,8 +587,28 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
            SELECT 1 FROM credit_ledger WHERE credit_ledger.user_id = users.id
          );",
     )?;
+    reclassify_images(connection)?;
 
     Ok(())
+}
+
+fn reclassify_images(connection: &mut Connection) -> rusqlite::Result<()> {
+    let images = {
+        let mut statement =
+            connection.prepare("SELECT id, prompt FROM images WHERE category_version < ?1")?;
+        let rows = statement.query_map([CATEGORY_VERSION], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let transaction = connection.transaction()?;
+    for (id, prompt) in images {
+        transaction.execute(
+            "UPDATE images SET category = ?1, category_version = ?2 WHERE id = ?3",
+            params![classify_prompt(&prompt), CATEGORY_VERSION, id],
+        )?;
+    }
+    transaction.commit()
 }
 
 fn migrate_provider_secrets(
@@ -859,5 +886,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn reclassifies_existing_images_after_rule_upgrade() {
+        let directory = tempdir().unwrap();
+        let master_key = [3_u8; 32];
+        let db = open_database(directory.path(), &master_key).unwrap();
+        database(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO users (
+                   id, name, email, password_hash, avatar, plan, credits, created_at
+                 ) VALUES (
+                   'category-user', 'Category', 'category@example.test',
+                   'hash', '', 'Free', 1, '2026-01-01T00:00:00Z'
+                 );
+                 INSERT INTO images (
+                   id, user_id, file_name, prompt, size, model, created_at,
+                   category, category_version
+                 ) VALUES (
+                   'category-image', 'category-user', 'category.png',
+                   '一只在咖啡杯旁打盹的橘猫', '1024x1024', 'gpt-image-2',
+                   '2026-01-01T00:00:00Z', '其他', 0
+                 );",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = open_database(directory.path(), &master_key).unwrap();
+        let category: (String, i64) = database(&db)
+            .unwrap()
+            .query_row(
+                "SELECT category, category_version FROM images WHERE id = 'category-image'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(category, ("动物宠物".into(), CATEGORY_VERSION));
     }
 }

@@ -7,6 +7,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
+    classification::{classify_prompt, CATEGORY_VERSION},
     db::{internal_error, read_database, write_database},
     model::{
         AppError, AppResult, GenerateRequest, ImageInput, ImageResponse, ProviderConfiguration,
@@ -80,7 +81,7 @@ pub(super) async fn store_outputs(
     errors: Vec<String>,
 ) -> AppResult<GenerationResult> {
     let created_at = Utc::now().to_rfc3339();
-    let category = prompt_category(&context.request.prompt);
+    let category = classify_prompt(&context.request.prompt);
     let mut rollback = OutputRollback::default();
     let mut stored = Vec::new();
     for (output_index, output) in outputs.into_iter().enumerate() {
@@ -220,8 +221,8 @@ pub(super) async fn store_outputs(
                     "INSERT INTO images (
                        id, user_id, file_name, prompt, size, model, created_at,
                        visibility, format, category, storage, device_id, reference_files,
-                       usage_log_id
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                       usage_log_id, category_version
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         file.id,
                         context.user.id,
@@ -236,7 +237,8 @@ pub(super) async fn store_outputs(
                         storage,
                         device_id,
                         reference_files,
-                        usage_log_id
+                        usage_log_id,
+                        CATEGORY_VERSION
                     ],
                 )
                 .map_err(internal_error)?;
@@ -313,6 +315,7 @@ pub(super) async fn store_outputs(
         .map(|file| ImageResponse {
             id: file.id.clone(),
             url: format!("/api/images/{}/file", file.id),
+            thumbnail_url: format!("/api/images/{}/thumbnail", file.id),
             prompt: context.request.prompt.trim().into(),
             size: context.request.size.clone(),
             model: context.provider.model.clone(),
@@ -338,38 +341,6 @@ pub(super) async fn store_outputs(
         usage,
         errors,
     })
-}
-
-fn prompt_category(prompt: &str) -> &'static str {
-    let prompt = prompt.to_lowercase();
-    if ["海报", "poster", "插画", "illustration"]
-        .iter()
-        .any(|keyword| prompt.contains(keyword))
-    {
-        "海报插画"
-    } else if ["产品", "product", "电商", "包装"]
-        .iter()
-        .any(|keyword| prompt.contains(keyword))
-    {
-        "产品电商"
-    } else if ["人像", "portrait", "人物", "摄影"]
-        .iter()
-        .any(|keyword| prompt.contains(keyword))
-    {
-        "人像摄影"
-    } else if ["ui", "界面", "app", "网页"]
-        .iter()
-        .any(|keyword| prompt.contains(keyword))
-    {
-        "UI/界面"
-    } else if ["3d", "渲染", "cgi"]
-        .iter()
-        .any(|keyword| prompt.contains(keyword))
-    {
-        "3D 渲染"
-    } else {
-        "其他"
-    }
 }
 
 #[cfg(test)]

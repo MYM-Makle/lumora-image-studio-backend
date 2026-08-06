@@ -145,6 +145,78 @@ pub(super) async fn create_tasks(
     Ok(ids)
 }
 
+pub(super) async fn retry_task(
+    state: &AppState,
+    user: &UserResponse,
+    id: &str,
+    metadata: RequestMetadata,
+) -> AppResult<Vec<String>> {
+    let (kind, status, request_json) = read_database(&state.db, |connection| {
+        connection
+            .query_row(
+                "SELECT kind, status, request_json FROM tasks WHERE id = ?1 AND user_id = ?2",
+                params![id, user.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal_error)?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "失败任务不存在".into()))
+    })?;
+    if status != "error" {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "只有失败任务可以重新生成".into(),
+        ));
+    }
+    let payload = serde_json::from_str::<TaskPayload>(&request_json)
+        .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "任务数据无效".into()))?;
+    if kind == "generation" {
+        return create_tasks(
+            state,
+            user,
+            "generation",
+            payload.generation,
+            None,
+            metadata,
+        )
+        .await;
+    }
+    if kind != "edit" {
+        return Err(AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "任务类型无效".into(),
+        ));
+    }
+    let task_directory = state.config.task_directory.join(id);
+    let images = load_task_inputs(&task_directory, &payload.input_files).await?;
+    let mask = if let Some(file_name) = &payload.mask_file {
+        Some(load_task_input(&task_directory, file_name).await?)
+    } else {
+        None
+    };
+    let generation = payload.generation.clone();
+    create_tasks(
+        state,
+        user,
+        "edit",
+        generation,
+        Some(EditRequest {
+            generation: payload.generation,
+            images,
+            mask,
+            batch: false,
+        }),
+        metadata,
+    )
+    .await
+}
+
 async fn cleanup_task_directories(state: &AppState, task_ids: &[String]) {
     for id in task_ids {
         let _ = fs::remove_dir_all(state.config.task_directory.join(id)).await;
@@ -257,7 +329,9 @@ pub(super) async fn run_task(state: &AppState, id: &str) -> AppResult<()> {
         }
     }
     .await;
-    let _ = fs::remove_dir_all(state.config.task_directory.join(id)).await;
+    if result.is_ok() {
+        let _ = fs::remove_dir_all(state.config.task_directory.join(id)).await;
+    }
     if let Err(error) = result {
         let status = read_database(&state.db, |connection| {
             connection

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{user_from_api_key, user_from_headers},
+    classification::category_rank,
     db::{internal_error, read_database, utc_day_bounds, write_database},
     model::{
         api_json, api_success, AnnouncementResponse, ApiResponse, AppError, AppResult,
@@ -137,16 +138,18 @@ pub async fn public_stats(State(state): State<AppState>) -> AppResult<Json<ApiRe
                  GROUP BY category ORDER BY COUNT(*) DESC",
             )
             .map_err(internal_error)?;
-        let categories = statement
+        let mut categories = statement
             .query_map([], |row| {
-                Ok(json!({
-                    "name": row.get::<_, String>(0)?,
-                    "count": row.get::<_, i64>(1)?
-                }))
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(internal_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_error)?;
+        categories.sort_by_key(|(name, _)| category_rank(name));
+        let categories = categories
+            .into_iter()
+            .map(|(name, count)| json!({ "name": name, "count": count }))
+            .collect::<Vec<_>>();
         Ok(Json(api_success(json!({
             "todayGenerations": today_generations,
             "publicImages": public_images,

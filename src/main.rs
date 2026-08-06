@@ -1,6 +1,7 @@
 mod account;
 mod admin;
 mod auth;
+mod classification;
 mod config;
 mod db;
 mod images;
@@ -165,10 +166,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/images/{id}", delete(images::delete_image))
         .route("/api/images/{id}/file", get(images::private_image_file))
         .route(
+            "/api/images/{id}/thumbnail",
+            get(images::private_image_thumbnail),
+        )
+        .route(
             "/api/images/{id}/references/{index}",
             get(images::private_image_reference_file),
         )
         .route("/api/image-tasks", get(images::list_active_image_tasks))
+        .route(
+            "/api/image-tasks/{id}/retry",
+            post(images::retry_image_task),
+        )
         .route("/api/image-tasks/{ids}", get(images::get_image_tasks))
         .route(
             "/api/image-tasks/{id}/references/{index}",
@@ -176,6 +185,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/gallery", get(images::public_gallery))
         .route("/public/images/{id}", get(images::public_image_file))
+        .route(
+            "/public/images/{id}/thumbnail",
+            get(images::public_image_thumbnail),
+        )
         .route("/api/admin/session", get(admin::session))
         .route("/api/admin/overview", get(admin::overview))
         .route("/api/admin/users", get(admin::list_users))
