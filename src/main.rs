@@ -179,7 +179,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/admin/session", get(admin::session))
         .route("/api/admin/overview", get(admin::overview))
         .route("/api/admin/users", get(admin::list_users))
-        .route("/api/admin/users/{id}", put(admin::update_user))
+        .route(
+            "/api/admin/users/credits/bulk",
+            post(admin::bulk_set_credits),
+        )
+        .route(
+            "/api/admin/users/{id}",
+            get(admin::get_user).put(admin::update_user),
+        )
         .route("/api/admin/users/{id}/credits", post(admin::adjust_credits))
         .route("/api/admin/credit-ledger", get(admin::list_credit_ledger))
         .route("/api/admin/usage-logs", get(admin::list_usage_logs))

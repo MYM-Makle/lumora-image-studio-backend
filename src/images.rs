@@ -635,6 +635,7 @@ async fn perform_generation(
             endpoint,
             duration_ms,
             task_id,
+            request.prompt.trim(),
             &message,
         )?;
         return Err(AppError(StatusCode::BAD_GATEWAY, message));
@@ -751,6 +752,7 @@ async fn perform_edit(
             endpoint,
             duration_ms,
             task_id,
+            request.generation.prompt.trim(),
             &message,
         )?;
         return Err(AppError(StatusCode::BAD_GATEWAY, message));

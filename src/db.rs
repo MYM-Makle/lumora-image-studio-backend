@@ -15,7 +15,7 @@ use crate::{
 };
 use axum::http::StatusCode;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const MIN_READERS: usize = 2;
 const MAX_READERS: usize = 8;
 
@@ -540,6 +540,18 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
         "user_agent",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column(
+        connection,
+        "usage_logs",
+        "prompt",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column(
+        connection,
+        "usage_logs",
+        "error",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_images_public_storage_created
          ON images(visibility, storage, created_at DESC);
@@ -551,6 +563,13 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
            VALUES ('registration_credits', 3000, CURRENT_TIMESTAMP);
          INSERT OR IGNORE INTO system_settings (key, value, updated_at)
            VALUES ('default_daily_limit', 10000, CURRENT_TIMESTAMP);
+         UPDATE usage_logs
+         SET prompt = COALESCE((
+           SELECT image.prompt FROM images image
+           WHERE image.usage_log_id = usage_logs.id
+           ORDER BY image.created_at, image.id LIMIT 1
+         ), '')
+         WHERE prompt = '';
          INSERT OR IGNORE INTO credit_ledger (
            id, user_id, delta, balance_after, reason, reference_id, created_at
          )

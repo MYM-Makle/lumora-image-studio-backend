@@ -97,6 +97,7 @@ pub(super) async fn store_outputs(
                 context.endpoint,
                 context.duration_ms,
                 context.task_id,
+                context.request.prompt.trim(),
                 "图片保存失败",
             )?;
             tracing::error!(error = %error, "image write failed");
@@ -129,6 +130,7 @@ pub(super) async fn store_outputs(
                     context.endpoint,
                     context.duration_ms,
                     context.task_id,
+                    context.request.prompt.trim(),
                     "参考图保存失败",
                 )?;
                 return Err(AppError(
@@ -165,6 +167,7 @@ pub(super) async fn store_outputs(
     };
     let usage_log_id = format!("log-{}", Uuid::new_v4().simple());
     let credit_reference = format!("generation:{}", context.task_id.unwrap_or(&usage_log_id));
+    let log_error = errors.join("；");
     let transaction_result = write_database(&context.state.db, |connection| {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -243,9 +246,9 @@ pub(super) async fn store_outputs(
                 "INSERT INTO usage_logs (
                    id, user_id, provider_id, endpoint, model, status,
                    duration_ms, credits_used, ip_address, device_id, platform,
-                   app_version, user_agent, created_at
+                   app_version, user_agent, prompt, error, created_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'success', ?6, ?7, ?8, ?9,
-                          ?10, ?11, ?12, ?13)",
+                          ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     usage_log_id,
                     context.user.id,
@@ -259,6 +262,8 @@ pub(super) async fn store_outputs(
                     context.metadata.platform,
                     context.metadata.app_version,
                     context.metadata.user_agent,
+                    context.request.prompt.trim(),
+                    log_error,
                     created_at
                 ],
             )
@@ -285,6 +290,7 @@ pub(super) async fn store_outputs(
             context.endpoint,
             context.duration_ms,
             context.task_id,
+            context.request.prompt.trim(),
             "图片记录保存失败",
         )?;
         return Err(error);

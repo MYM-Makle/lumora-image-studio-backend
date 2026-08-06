@@ -57,6 +57,7 @@ pub(super) fn settle_failure(
     endpoint: &str,
     duration_ms: i64,
     task_id: Option<&str>,
+    prompt: &str,
     message: &str,
 ) -> AppResult<()> {
     write_database(&state.db, |connection| {
@@ -75,9 +76,9 @@ pub(super) fn settle_failure(
                 "INSERT INTO usage_logs (
                    id, user_id, provider_id, endpoint, model, status,
                    duration_ms, credits_used, ip_address, device_id, platform,
-                   app_version, user_agent, created_at
+                   app_version, user_agent, prompt, error, created_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, 'error', ?6, 0, ?7, ?8, ?9,
-                           ?10, ?11, ?12)",
+                           ?10, ?11, ?12, ?13, ?14)",
                 params![
                     format!("log-{}", Uuid::new_v4().simple()),
                     user_id,
@@ -90,6 +91,8 @@ pub(super) fn settle_failure(
                     metadata.platform,
                     metadata.app_version,
                     metadata.user_agent,
+                    prompt.trim(),
+                    message,
                     Utc::now().to_rfc3339()
                 ],
             )

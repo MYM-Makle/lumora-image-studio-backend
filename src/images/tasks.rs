@@ -97,6 +97,7 @@ pub(super) async fn create_tasks(
             "/v1/tasks",
             0,
             None,
+            generation.prompt.trim(),
             "任务创建失败",
         )?;
         return Err(error);
@@ -132,6 +133,7 @@ pub(super) async fn create_tasks(
             "/v1/tasks",
             0,
             None,
+            generation.prompt.trim(),
             "任务创建失败",
         )?;
         return Err(error);
@@ -210,6 +212,10 @@ pub(super) async fn run_task(state: &AppState, id: &str) -> AppResult<()> {
         .as_ref()
         .map(|payload| payload.request_metadata.clone())
         .unwrap_or_default();
+    let prompt = payload
+        .as_ref()
+        .map(|payload| payload.generation.prompt.clone())
+        .unwrap_or_default();
     let result = async {
         let payload = payload?;
         if kind == "generation" {
@@ -271,6 +277,7 @@ pub(super) async fn run_task(state: &AppState, id: &str) -> AppResult<()> {
                 "/v1/tasks",
                 0,
                 Some(id),
+                prompt.trim(),
                 &error.1,
             )?;
         }

@@ -290,6 +290,80 @@ pub async fn list_users(
     })
 }
 
+pub async fn get_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    admin_user(&headers, &state)?;
+    read_database(&state.db, |connection| {
+        let mut detail = connection
+            .query_row(
+                "SELECT id, name, email, avatar, plan, credits, credits_reserved,
+                    daily_limit, status, is_admin, created_at, last_login_at,
+                    last_seen_at, password_hash <> ''
+                 FROM users WHERE id = ?1",
+                [&id],
+                |row| {
+                    let credits = row.get::<_, i64>(5)?;
+                    let reserved = row.get::<_, i64>(6)?;
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "name": row.get::<_, String>(1)?,
+                        "email": row.get::<_, String>(2)?,
+                        "avatar": row.get::<_, String>(3)?,
+                        "plan": row.get::<_, String>(4)?,
+                        "credits": credits,
+                        "creditsReserved": reserved,
+                        "availableCredits": credits - reserved,
+                        "dailyLimit": row.get::<_, i64>(7)?,
+                        "status": row.get::<_, String>(8)?,
+                        "isAdmin": row.get::<_, bool>(9)?,
+                        "createdAt": row.get::<_, String>(10)?,
+                        "lastLoginAt": row.get::<_, Option<String>>(11)?,
+                        "lastSeenAt": row.get::<_, Option<String>>(12)?,
+                        "passwordConfigured": row.get::<_, bool>(13)?
+                    }))
+                },
+            )
+            .optional()
+            .map_err(internal_error)?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "用户不存在".into()))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, name, base_url,
+                    COALESCE(key_prefix, substr(api_key, 1, 9)),
+                    COALESCE(key_suffix, substr(api_key, -4)),
+                    model, is_active, created_at, encryption_version, is_global
+                 FROM providers
+                 WHERE user_id = ?1 OR is_global = 1
+                 ORDER BY is_global ASC, is_active DESC, created_at DESC",
+            )
+            .map_err(internal_error)?;
+        let providers = statement
+            .query_map([&id], |row| {
+                let prefix = row.get::<_, String>(3)?;
+                let suffix = row.get::<_, String>(4)?;
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "baseUrl": row.get::<_, String>(2)?,
+                    "maskedApiKey": mask_key(&prefix, &suffix),
+                    "model": row.get::<_, String>(5)?,
+                    "isActive": row.get::<_, bool>(6)?,
+                    "createdAt": row.get::<_, String>(7)?,
+                    "needsRotation": row.get::<_, i64>(8)? == 0,
+                    "source": if row.get::<_, bool>(9)? { "system" } else { "user" }
+                }))
+            })
+            .map_err(internal_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        detail["providers"] = json!(providers);
+        Ok(Json(api_success(detail)))
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateUserRequest {
@@ -477,6 +551,128 @@ pub async fn adjust_credits(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BulkCreditSetRequest {
+    user_ids: Vec<String>,
+    credits: i64,
+    reason: String,
+    request_id: String,
+}
+
+pub async fn bulk_set_credits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<BulkCreditSetRequest>, JsonRejection>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let request = api_json(payload)?;
+    let admin = admin_user(&headers, &state)?;
+    let mut user_ids = request
+        .user_ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .collect::<Vec<_>>();
+    user_ids.sort();
+    user_ids.dedup();
+    let reason = request.reason.trim().to_string();
+    let request_id = request.request_id.trim().to_string();
+    if user_ids.is_empty()
+        || user_ids.len() > 100
+        || user_ids.iter().any(|id| id.is_empty() || id.len() > 128)
+        || !(0..=1_000_000_000).contains(&request.credits)
+        || reason.len() < 2
+        || reason.len() > 200
+        || request_id.len() < 8
+        || request_id.len() > 128
+    {
+        return Err(AppError(StatusCode::BAD_REQUEST, "批量积分参数无效".into()));
+    }
+    let updated = write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let mut updated = 0;
+        for id in &user_ids {
+            let reference_id = format!("admin-bulk:{request_id}:{id}");
+            if let Some((existing_user_id, balance)) = transaction
+                .query_row(
+                    "SELECT user_id, balance_after FROM credit_ledger WHERE reference_id = ?1",
+                    [&reference_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(internal_error)?
+            {
+                if existing_user_id != *id || balance != request.credits {
+                    return Err(AppError(StatusCode::CONFLICT, "请求流水号已被使用".into()));
+                }
+                continue;
+            }
+            let (current, reserved) = transaction
+                .query_row(
+                    "SELECT credits, credits_reserved FROM users WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(internal_error)?
+                .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "用户不存在".into()))?;
+            if request.credits < reserved {
+                return Err(AppError(
+                    StatusCode::CONFLICT,
+                    "统一积分不能低于用户已预扣积分".into(),
+                ));
+            }
+            transaction
+                .execute(
+                    "UPDATE users SET credits = ?1 WHERE id = ?2",
+                    params![request.credits, id],
+                )
+                .map_err(internal_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO credit_ledger (
+                       id, user_id, delta, balance_after, reason, reference_id,
+                       operator_user_id, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        format!("credit-{}", Uuid::new_v4().simple()),
+                        id,
+                        request.credits - current,
+                        request.credits,
+                        reason,
+                        reference_id,
+                        admin.id,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(internal_error)?;
+            updated += 1;
+        }
+        if updated > 0 {
+            write_audit(
+                &transaction,
+                &admin.id,
+                "bulk_set_credits",
+                "users",
+                &request_id,
+                json!({
+                    "userIds": user_ids,
+                    "credits": request.credits,
+                    "reason": reason
+                }),
+            )
+            .map_err(internal_error)?;
+        }
+        transaction.commit().map_err(internal_error)?;
+        Ok(updated)
+    })?;
+    Ok(Json(api_success(json!({
+        "updated": updated,
+        "credits": request.credits
+    }))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LedgerQuery {
     page: Option<u32>,
     page_size: Option<u32>,
@@ -566,7 +762,8 @@ pub async fn list_usage_logs(
                 "SELECT COUNT(*)
              FROM usage_logs l JOIN users u ON u.id = l.user_id
              WHERE (?1 = '' OR lower(u.email) LIKE ?2 OR lower(l.ip_address) LIKE ?2
-                    OR lower(l.device_id) LIKE ?2 OR lower(l.endpoint) LIKE ?2)
+                    OR lower(l.device_id) LIKE ?2 OR lower(l.endpoint) LIKE ?2
+                    OR lower(l.prompt) LIKE ?2 OR lower(l.error) LIKE ?2)
                AND (?3 = '' OR l.status = ?3)",
                 params![search, pattern, status],
                 |row| row.get::<_, i64>(0),
@@ -577,7 +774,7 @@ pub async fn list_usage_logs(
                 "SELECT l.id, l.user_id, u.email, COALESCE(p.name, ''), l.endpoint,
                     l.model, l.status, l.duration_ms, l.credits_used,
                     l.ip_address, l.device_id, l.platform, l.app_version,
-                    l.user_agent, l.created_at, i.id
+                    l.user_agent, l.created_at, l.prompt, l.error, i.id
              FROM usage_logs l
              JOIN users u ON u.id = l.user_id
              LEFT JOIN providers p ON p.id = l.provider_id
@@ -587,7 +784,8 @@ pub async fn list_usage_logs(
                ORDER BY image.created_at, image.id LIMIT 1
              )
              WHERE (?1 = '' OR lower(u.email) LIKE ?2 OR lower(l.ip_address) LIKE ?2
-                    OR lower(l.device_id) LIKE ?2 OR lower(l.endpoint) LIKE ?2)
+                    OR lower(l.device_id) LIKE ?2 OR lower(l.endpoint) LIKE ?2
+                    OR lower(l.prompt) LIKE ?2 OR lower(l.error) LIKE ?2)
                AND (?3 = '' OR l.status = ?3)
              ORDER BY l.created_at DESC LIMIT ?4 OFFSET ?5",
             )
@@ -597,7 +795,7 @@ pub async fn list_usage_logs(
                 params![search, pattern, status, page_size, (page - 1) * page_size],
                 |row| {
                     let image_url = row
-                        .get::<_, Option<String>>(15)?
+                        .get::<_, Option<String>>(17)?
                         .map(|id| format!("/api/admin/images/{id}/file"));
                     Ok(json!({
                         "id": row.get::<_, String>(0)?,
@@ -615,6 +813,8 @@ pub async fn list_usage_logs(
                         "appVersion": row.get::<_, String>(12)?,
                         "userAgent": row.get::<_, String>(13)?,
                         "createdAt": row.get::<_, String>(14)?,
+                        "prompt": row.get::<_, String>(15)?,
+                        "error": row.get::<_, String>(16)?,
                         "imageUrl": image_url
                     }))
                 },
@@ -1432,6 +1632,128 @@ mod tests {
         .unwrap();
         assert_eq!(users.0.data["items"][0]["totalCalls"], 3);
         assert_eq!(users.0.data["items"][0]["creditsUsed"], 6);
+    }
+
+    #[tokio::test]
+    async fn bulk_sets_user_credits_idempotently() {
+        let (_directory, state) = test_state();
+        database(&state.db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO users (
+                   id, name, email, password_hash, avatar, plan, credits,
+                   credits_reserved, daily_limit, status, is_admin, created_at
+                 ) VALUES
+                   ('user-2', 'User 2', 'user2@example.test', 'hash', '', 'Free',
+                    10, 2, 100, 'active', 0, '2026-01-01T00:00:00Z'),
+                   ('user-3', 'User 3', 'user3@example.test', 'hash', '', 'Free',
+                    20, 0, 100, 'active', 0, '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+
+        let request = || -> Result<Json<BulkCreditSetRequest>, JsonRejection> {
+            Ok(Json(BulkCreditSetRequest {
+                user_ids: vec!["user-2".into(), "user-3".into()],
+                credits: 80,
+                reason: "统一发放".into(),
+                request_id: "bulk-request-1".into(),
+            }))
+        };
+        let response = bulk_set_credits(State(state.clone()), admin_headers(), request())
+            .await
+            .unwrap();
+        assert_eq!(response.0.data["updated"], 2);
+
+        let connection = database(&state.db).unwrap();
+        let balances = connection
+            .prepare("SELECT credits FROM users WHERE id IN ('user-2', 'user-3') ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(balances, vec![80, 80]);
+        drop(connection);
+
+        let repeated = bulk_set_credits(State(state.clone()), admin_headers(), request())
+            .await
+            .unwrap();
+        assert_eq!(repeated.0.data["updated"], 0);
+        let ledger_count = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_ledger
+                 WHERE reference_id LIKE 'admin-bulk:bulk-request-1:%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(ledger_count, 2);
+    }
+
+    #[tokio::test]
+    async fn returns_user_details_with_masked_providers() {
+        let (_directory, state) = test_state();
+        database(&state.db)
+            .unwrap()
+            .execute(
+                "INSERT INTO providers (
+                   id, user_id, name, base_url, api_key, api_key_cipher,
+                   key_prefix, key_suffix, encryption_version, model,
+                   is_active, is_global, created_at
+                 ) VALUES (
+                   'provider-user', 'admin-1', 'User Provider', 'https://example.test',
+                   '', 'cipher', 'sk-admin-', 'tail', 1, 'test-model', 1, 0,
+                   '2026-01-01T00:00:00Z'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let response = get_user(State(state), admin_headers(), AxumPath("admin-1".into()))
+            .await
+            .unwrap();
+        assert_eq!(response.0.data["email"], "admin@example.test");
+        assert_eq!(response.0.data["passwordConfigured"], true);
+        assert!(response.0.data.get("passwordHash").is_none());
+        assert_eq!(response.0.data["providers"][0]["name"], "User Provider");
+        assert_eq!(
+            response.0.data["providers"][0]["maskedApiKey"],
+            "sk-admin-••••••••••••tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_logs_include_prompt_and_error() {
+        let (_directory, state) = test_state();
+        database(&state.db)
+            .unwrap()
+            .execute(
+                "INSERT INTO usage_logs (
+                   id, user_id, endpoint, model, status, duration_ms, credits_used,
+                   prompt, error, created_at
+                 ) VALUES (
+                   'usage-error', 'admin-1', '/v1/images/generations', 'test-model',
+                   'error', 25, 0, '测试提示词', '上游请求失败', ?1
+                 )",
+                [Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+
+        let response = list_usage_logs(
+            State(state),
+            admin_headers(),
+            Query(UsageLogQuery {
+                page: Some(1),
+                page_size: Some(20),
+                q: None,
+                status: Some("error".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0.data["items"][0]["prompt"], "测试提示词");
+        assert_eq!(response.0.data["items"][0]["error"], "上游请求失败");
     }
 
     #[tokio::test]
