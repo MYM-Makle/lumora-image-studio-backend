@@ -173,12 +173,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/images/{id}/references/{index}",
             get(images::private_image_reference_file),
         )
-        .route("/api/image-tasks", get(images::list_active_image_tasks))
+        .route(
+            "/api/image-tasks",
+            get(images::list_active_image_tasks).delete(images::clear_failed_image_tasks),
+        )
         .route(
             "/api/image-tasks/{id}/retry",
             post(images::retry_image_task),
         )
-        .route("/api/image-tasks/{ids}", get(images::get_image_tasks))
+        .route(
+            "/api/image-tasks/{ids}",
+            get(images::get_image_tasks).delete(images::delete_failed_image_task),
+        )
         .route(
             "/api/image-tasks/{id}/references/{index}",
             get(images::private_task_reference_file),

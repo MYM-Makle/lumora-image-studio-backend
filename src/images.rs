@@ -1043,6 +1043,100 @@ pub async fn get_image_tasks(
     }))))
 }
 
+pub async fn delete_failed_image_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let user = user_from_headers(&headers, &state)?;
+    let status = read_database(&state.db, |connection| {
+        connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1 AND user_id = ?2",
+                params![id, user.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal_error)?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "任务不存在".into()))
+    })?;
+    if status != "error" {
+        return Err(AppError(StatusCode::CONFLICT, "只能删除失败任务".into()));
+    }
+
+    let original = state.config.task_directory.join(&id);
+    let trash = state
+        .config
+        .task_directory
+        .join(format!(".deleting-{}", Uuid::new_v4().simple()));
+    let moved = fs::rename(&original, &trash).await.is_ok();
+    let deleted = write_database(&state.db, |connection| {
+        connection
+            .execute(
+                "DELETE FROM tasks WHERE id = ?1 AND user_id = ?2 AND status = 'error'",
+                params![id, user.id],
+            )
+            .map_err(internal_error)
+    });
+    if let Err(error) = deleted {
+        if moved {
+            let _ = fs::rename(&trash, &original).await;
+        }
+        return Err(error);
+    }
+    if moved {
+        let _ = fs::remove_dir_all(trash).await;
+    }
+    Ok(Json(api_success(Value::Null)))
+}
+
+pub async fn clear_failed_image_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let user = user_from_headers(&headers, &state)?;
+    let ids = read_database(&state.db, |connection| {
+        let mut statement = connection
+            .prepare("SELECT id FROM tasks WHERE user_id = ?1 AND status = 'error'")
+            .map_err(internal_error)?;
+        let ids = statement
+            .query_map([&user.id], |row| row.get::<_, String>(0))
+            .map_err(internal_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        Ok(ids)
+    })?;
+    let mut moved = Vec::new();
+    for id in &ids {
+        let original = state.config.task_directory.join(id);
+        let trash = state
+            .config
+            .task_directory
+            .join(format!(".deleting-{}", Uuid::new_v4().simple()));
+        if fs::rename(&original, &trash).await.is_ok() {
+            moved.push((original, trash));
+        }
+    }
+    let deleted = write_database(&state.db, |connection| {
+        connection
+            .execute(
+                "DELETE FROM tasks WHERE user_id = ?1 AND status = 'error'",
+                [&user.id],
+            )
+            .map_err(internal_error)
+    });
+    if let Err(error) = deleted {
+        for (original, trash) in moved {
+            let _ = fs::rename(trash, original).await;
+        }
+        return Err(error);
+    }
+    for (_, trash) in moved {
+        let _ = fs::remove_dir_all(trash).await;
+    }
+    Ok(Json(api_success(Value::Null)))
+}
+
 fn task_summaries(state: &AppState, user_id: &str, ids: &[String]) -> AppResult<Vec<Value>> {
     read_database(&state.db, |connection| {
         let mut items = Vec::new();
@@ -1695,6 +1789,109 @@ mod tests {
         .unwrap();
         assert_eq!(requested["data"]["items"].as_array().unwrap().len(), 2);
         assert_eq!(requested["data"]["items"][1]["status"], "success");
+    }
+
+    #[tokio::test]
+    async fn deletes_only_failed_image_tasks() {
+        let (_directory, state, user) = test_state(3).await;
+        let now = Utc::now().to_rfc3339();
+        let payload = serde_json::to_string(&TaskPayload {
+            generation: generation_request(1),
+            input_files: vec!["input-0.png".into()],
+            mask_file: None,
+            request_metadata: RequestMetadata::default(),
+        })
+        .unwrap();
+        let connection = database(&state.db).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('delete-task-session', ?1, ?2, '2099-01-01T00:00:00Z')",
+                params![user.id, now],
+            )
+            .unwrap();
+        for (id, status) in [
+            ("task-failed-one", "error"),
+            ("task-failed-two", "error"),
+            ("task-running", "running"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO tasks (
+                       id, user_id, kind, status, request_json, credits_reserved,
+                       credits_used, created_at, updated_at
+                     ) VALUES (?1, ?2, 'edit', ?3, ?4, 1, 0, ?5, ?5)",
+                    params![id, user.id, status, payload, now],
+                )
+                .unwrap();
+            let directory = state.config.task_directory.join(id);
+            std_fs::create_dir_all(&directory).unwrap();
+            std_fs::write(directory.join("input-0.png"), png_bytes()).unwrap();
+        }
+        drop(connection);
+
+        let app = Router::new()
+            .route(
+                "/api/image-tasks",
+                get(list_active_image_tasks).delete(clear_failed_image_tasks),
+            )
+            .route(
+                "/api/image-tasks/{ids}",
+                get(get_image_tasks).delete(delete_failed_image_task),
+            )
+            .with_state(state.clone());
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/image-tasks/task-failed-one")
+                    .header(header::COOKIE, "lumora_session=delete-task-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert!(!state.config.task_directory.join("task-failed-one").exists());
+
+        let active_delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/image-tasks/task-running")
+                    .header(header::COOKIE, "lumora_session=delete-task-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_delete.status(), StatusCode::CONFLICT);
+
+        let cleared = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/image-tasks")
+                    .header(header::COOKIE, "lumora_session=delete-task-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let connection = database(&state.db).unwrap();
+        let remaining: Vec<(String, String)> = connection
+            .prepare("SELECT id, status FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec![("task-running".into(), "running".into())]);
+        assert!(!state.config.task_directory.join("task-failed-two").exists());
+        assert!(state.config.task_directory.join("task-running").exists());
     }
 
     #[tokio::test]
