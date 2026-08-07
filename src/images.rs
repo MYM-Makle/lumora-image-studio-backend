@@ -80,6 +80,8 @@ pub struct GalleryQuery {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageListQuery {
+    q: Option<String>,
+    visibility: Option<String>,
     page: Option<u32>,
     page_size: Option<u32>,
 }
@@ -115,30 +117,62 @@ pub async fn list_images(
     let query = api_query(query)?;
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(30).clamp(1, 50);
+    let search = query.q.unwrap_or_default().trim().to_string();
+    let visibility = match query.visibility.unwrap_or_default().trim() {
+        "" | "all" => "",
+        "public" => "public",
+        "private" => "private",
+        _ => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "图片可见性筛选无效".into(),
+            ))
+        }
+    };
     let user = user_from_headers(&headers, &state)?;
     let device_id = header_text(&headers, "x-lumora-device-id", 128).unwrap_or_default();
     read_database(&state.db, |connection| {
-        let total: i64 = connection
+        let (all_total, public_total, private_total): (i64, i64, i64) = connection
             .query_row(
-                "SELECT COUNT(*) FROM images
-                 WHERE user_id = ?1 AND (storage = 'server' OR device_id = ?2)",
-                params![user.id, device_id],
-                |row| row.get(0),
+                "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN visibility = 'public' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN visibility = 'private' THEN 1 ELSE 0 END), 0)
+                 FROM images
+                 WHERE user_id = ?1 AND (storage = 'server' OR device_id = ?2)
+                   AND (?3 = '' OR lower(prompt) LIKE '%' || lower(?3) || '%'
+                        OR lower(category) LIKE '%' || lower(?3) || '%')",
+                params![user.id, device_id, search],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(internal_error)?;
+        let total = match visibility {
+            "public" => public_total,
+            "private" => private_total,
+            _ => all_total,
+        };
         let mut statement = connection
             .prepare(
                 "SELECT id, prompt, size, model, created_at, format, visibility, category,
                     storage, reference_files
              FROM images
              WHERE user_id = ?1 AND (storage = 'server' OR device_id = ?2)
-             ORDER BY created_at DESC LIMIT ?3 OFFSET ?4",
+               AND (?3 = '' OR lower(prompt) LIKE '%' || lower(?3) || '%'
+                    OR lower(category) LIKE '%' || lower(?3) || '%')
+               AND (?4 = '' OR visibility = ?4)
+             ORDER BY created_at DESC LIMIT ?5 OFFSET ?6",
             )
             .map_err(internal_error)?;
         let items = statement
             .query_map(
-                params![user.id, device_id, page_size, (page - 1) * page_size],
-                |row| image_from_row(row, false, None),
+                params![
+                    user.id,
+                    device_id,
+                    search,
+                    visibility,
+                    page_size,
+                    (page - 1) * page_size
+                ],
+                |row| image_from_row(row, false, None, false),
             )
             .map_err(internal_error)?
             .collect::<Result<Vec<_>, _>>()
@@ -146,6 +180,9 @@ pub async fn list_images(
         Ok(Json(api_success(json!({
             "items": items,
             "total": total,
+            "allTotal": all_total,
+            "publicTotal": public_total,
+            "privateTotal": private_total,
             "page": page,
             "pageSize": page_size
         }))))
@@ -184,6 +221,11 @@ pub async fn update_image_visibility(
                 params![visibility, id, user.id],
             )
             .map_err(internal_error)?;
+        if !request.is_public {
+            transaction
+                .execute("DELETE FROM favorites WHERE image_id = ?1", [&id])
+                .map_err(internal_error)?;
+        }
         transaction.commit().map_err(internal_error)?;
         Ok(record)
     })?;
@@ -358,6 +400,7 @@ pub async fn localize_image(
 
 pub async fn public_gallery(
     State(state): State<AppState>,
+    headers: HeaderMap,
     query: Result<Query<GalleryQuery>, axum::extract::rejection::QueryRejection>,
 ) -> AppResult<Json<ApiResponse<Value>>> {
     let query = api_query(query)?;
@@ -365,6 +408,10 @@ pub async fn public_gallery(
     let page_size = query.page_size.unwrap_or(24).clamp(1, 100);
     let search = query.q.unwrap_or_default().trim().to_string();
     let category = query.category.unwrap_or_default().trim().to_string();
+    let favorite_user_id = user_from_headers(&headers, &state)
+        .ok()
+        .map(|user| user.id)
+        .unwrap_or_default();
     read_database(&state.db, |connection| {
         let total: i64 = connection
             .query_row(
@@ -379,20 +426,31 @@ pub async fn public_gallery(
         let mut statement = connection
             .prepare(
                 "SELECT i.id, i.prompt, i.size, i.model, i.created_at, i.format,
-                    i.visibility, i.category, i.storage, '[]', u.name
+                    i.visibility, i.category, i.storage, '[]', u.name,
+                    EXISTS(
+                      SELECT 1 FROM favorites f
+                      WHERE f.user_id = ?3 AND f.image_id = i.id
+                    )
              FROM images i JOIN users u ON u.id = i.user_id
              WHERE i.visibility = 'public'
                AND (?1 = '' OR lower(i.prompt) LIKE '%' || lower(?1) || '%')
                AND (?2 = '' OR ?2 = '全部' OR i.category = ?2)
-             ORDER BY i.created_at DESC LIMIT ?3 OFFSET ?4",
+             ORDER BY i.created_at DESC LIMIT ?4 OFFSET ?5",
             )
             .map_err(internal_error)?;
         let items = statement
             .query_map(
-                params![search, category, page_size, (page - 1) * page_size],
+                params![
+                    search,
+                    category,
+                    favorite_user_id,
+                    page_size,
+                    (page - 1) * page_size
+                ],
                 |row| {
                     let author: String = row.get(10)?;
-                    image_from_row(row, true, Some(author))
+                    let is_favorited: bool = row.get(11)?;
+                    image_from_row(row, true, Some(author), is_favorited)
                 },
             )
             .map_err(internal_error)?
@@ -407,10 +465,122 @@ pub async fn public_gallery(
     })
 }
 
+pub async fn list_favorites(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<ImageListQuery>, axum::extract::rejection::QueryRejection>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let query = api_query(query)?;
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(30).clamp(1, 50);
+    let search = query.q.unwrap_or_default().trim().to_string();
+    let user = user_from_headers(&headers, &state)?;
+    read_database(&state.db, |connection| {
+        let total: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM favorites f JOIN images i ON i.id = f.image_id
+                 JOIN users u ON u.id = i.user_id
+                 WHERE f.user_id = ?1 AND i.visibility = 'public'
+                   AND (?2 = '' OR lower(i.prompt) LIKE '%' || lower(?2) || '%'
+                        OR lower(i.category) LIKE '%' || lower(?2) || '%'
+                        OR lower(u.name) LIKE '%' || lower(?2) || '%')",
+                params![user.id, search],
+                |row| row.get(0),
+            )
+            .map_err(internal_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT i.id, i.prompt, i.size, i.model, i.created_at, i.format,
+                    i.visibility, i.category, i.storage, '[]', u.name, f.created_at
+                 FROM favorites f
+                 JOIN images i ON i.id = f.image_id
+                 JOIN users u ON u.id = i.user_id
+                 WHERE f.user_id = ?1 AND i.visibility = 'public'
+                   AND (?2 = '' OR lower(i.prompt) LIKE '%' || lower(?2) || '%'
+                        OR lower(i.category) LIKE '%' || lower(?2) || '%'
+                        OR lower(u.name) LIKE '%' || lower(?2) || '%')
+                 ORDER BY f.created_at DESC LIMIT ?3 OFFSET ?4",
+            )
+            .map_err(internal_error)?;
+        let items = statement
+            .query_map(
+                params![user.id, search, page_size, (page - 1) * page_size],
+                |row| {
+                    let author: String = row.get(10)?;
+                    let mut image = image_from_row(row, true, Some(author), true)?;
+                    image.favorited_at = Some(row.get(11)?);
+                    Ok(image)
+                },
+            )
+            .map_err(internal_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        Ok(Json(api_success(json!({
+            "items": items,
+            "total": total,
+            "page": page,
+            "pageSize": page_size
+        }))))
+    })
+}
+
+pub async fn add_favorite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let user = user_from_headers(&headers, &state)?;
+    write_database(&state.db, |connection| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal_error)?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM images WHERE id = ?1 AND visibility = 'public'
+                 )",
+                [&id],
+                |row| row.get(0),
+            )
+            .map_err(internal_error)?;
+        if !exists {
+            return Err(AppError(StatusCode::NOT_FOUND, "公开图片不存在".into()));
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO favorites (user_id, image_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![user.id, id, Utc::now().to_rfc3339()],
+            )
+            .map_err(internal_error)?;
+        transaction.commit().map_err(internal_error)?;
+        Ok(Json(api_success(json!({ "id": id, "isFavorited": true }))))
+    })
+}
+
+pub async fn remove_favorite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> AppResult<Json<ApiResponse<Value>>> {
+    let user = user_from_headers(&headers, &state)?;
+    write_database(&state.db, |connection| {
+        connection
+            .execute(
+                "DELETE FROM favorites WHERE user_id = ?1 AND image_id = ?2",
+                params![user.id, id],
+            )
+            .map_err(internal_error)?;
+        Ok(Json(api_success(json!({ "id": id, "isFavorited": false }))))
+    })
+}
+
 fn image_from_row(
     row: &rusqlite::Row<'_>,
     public: bool,
     author: Option<String>,
+    is_favorited: bool,
 ) -> rusqlite::Result<ImageResponse> {
     let id: String = row.get(0)?;
     let reference_images = if public {
@@ -442,9 +612,11 @@ fn image_from_row(
         source: "generated",
         format: row.get(5)?,
         is_public: row.get::<_, String>(6)? == "public",
+        is_favorited,
         category: row.get(7)?,
         storage: row.get(8)?,
         author,
+        favorited_at: None,
         reference_images,
     })
 }
@@ -1895,7 +2067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_failed_generation_as_a_new_task() {
+    async fn retries_failed_generation_in_place() {
         let (_directory, state, user) = test_state(3).await;
         state.task_semaphore.close();
         let now = Utc::now().to_rfc3339();
@@ -1921,25 +2093,32 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(retried.len(), 1);
-        assert_ne!(retried[0], "task-failed");
+        assert_eq!(retried, vec!["task-failed"]);
         let connection = database(&state.db).unwrap();
-        let old_status: String = connection
+        let task: (String, Option<String>, i64) = connection
             .query_row(
-                "SELECT status FROM tasks WHERE id = 'task-failed'",
+                "SELECT status, error, credits_used FROM tasks WHERE id = 'task-failed'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        let new_status: String = connection
+        let task_count: i64 = connection
             .query_row(
-                "SELECT status FROM tasks WHERE id = ?1",
-                [&retried[0]],
+                "SELECT COUNT(*) FROM tasks WHERE user_id = ?1",
+                [&user.id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(old_status, "error");
-        assert_eq!(new_status, "queued");
+        let credits_reserved: i64 = connection
+            .query_row(
+                "SELECT credits_reserved FROM users WHERE id = ?1",
+                [&user.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task, ("queued".into(), None, 0));
+        assert_eq!(task_count, 1);
+        assert_eq!(credits_reserved, 1);
     }
 
     #[tokio::test]
@@ -2043,6 +2222,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(published, "public");
+        database(&state.db)
+            .unwrap()
+            .execute(
+                "INSERT INTO favorites (user_id, image_id, created_at)
+                 VALUES (?1, 'private-image', ?2)",
+                params![user.id, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
 
         let response = app
             .clone()
@@ -2067,6 +2254,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unpublished, "private");
+        let favorite_count: i64 = database(&state.db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM favorites WHERE image_id = 'private-image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(favorite_count, 0);
 
         let response = app
             .oneshot(
@@ -2499,6 +2695,191 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(local_public_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn filters_owned_images_and_returns_visibility_totals() {
+        let (_directory, state, user) = test_state(1).await;
+        let now = Utc::now().to_rfc3339();
+        let connection = database(&state.db).unwrap();
+        for (id, prompt, visibility) in [
+            ("owned-public", "Blue poster", "public"),
+            ("owned-private", "Private cat", "private"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO images (
+                       id, user_id, file_name, prompt, size, model, created_at,
+                       visibility, format, category
+                     ) VALUES (?1, ?2, ?3, ?4, '1024x1024', ?5, ?6, ?7, 'png', 'test')",
+                    params![
+                        id,
+                        user.id,
+                        format!("{id}.png"),
+                        prompt,
+                        MODEL,
+                        now,
+                        visibility
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('owned-session', ?1, ?2, '2099-01-01T00:00:00Z')",
+                params![user.id, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let app = Router::new()
+            .route("/api/images", get(list_images))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/images?q=poster&visibility=public")
+                    .header(header::COOKIE, "lumora_session=owned-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["data"]["total"], 1);
+        assert_eq!(body["data"]["allTotal"], 1);
+        assert_eq!(body["data"]["publicTotal"], 1);
+        assert_eq!(body["data"]["privateTotal"], 0);
+        assert_eq!(body["data"]["items"][0]["id"], "owned-public");
+    }
+
+    #[tokio::test]
+    async fn manages_public_image_favorites_for_the_current_user() {
+        let (_directory, state, user) = test_state(1).await;
+        let now = Utc::now().to_rfc3339();
+        let connection = database(&state.db).unwrap();
+        for (id, visibility) in [
+            ("favorite-public", "public"),
+            ("favorite-private", "private"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO images (
+                       id, user_id, file_name, prompt, size, model, created_at,
+                       visibility, format, category
+                     ) VALUES (?1, ?2, ?3, ?4, '1024x1024', ?5, ?6, ?7, 'png', 'test')",
+                    params![id, user.id, format!("{id}.png"), id, MODEL, now, visibility],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at)
+                 VALUES ('favorite-session', ?1, ?2, '2099-01-01T00:00:00Z')",
+                params![user.id, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let app = Router::new()
+            .route("/api/gallery", get(public_gallery))
+            .route("/api/favorites", get(list_favorites))
+            .route(
+                "/api/favorites/{id}",
+                put(add_favorite).delete(remove_favorite),
+            )
+            .with_state(state);
+        let favorite = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/favorites/favorite-public")
+                    .header(header::COOKIE, "lumora_session=favorite-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(favorite.status(), StatusCode::OK);
+
+        let private = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/favorites/favorite-private")
+                    .header(header::COOKIE, "lumora_session=favorite-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(private.status(), StatusCode::NOT_FOUND);
+
+        let favorites = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/favorites?q=favorite-public")
+                    .header(header::COOKIE, "lumora_session=favorite-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let favorites: Value =
+            serde_json::from_slice(&to_bytes(favorites.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(favorites["data"]["total"], 1);
+        assert_eq!(favorites["data"]["items"][0]["id"], "favorite-public");
+        assert_eq!(favorites["data"]["items"][0]["isFavorited"], true);
+        assert!(favorites["data"]["items"][0]["favoritedAt"].is_string());
+
+        let gallery = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/gallery")
+                    .header(header::COOKIE, "lumora_session=favorite-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let gallery: Value =
+            serde_json::from_slice(&to_bytes(gallery.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(gallery["data"]["items"][0]["isFavorited"], true);
+
+        let removed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/favorites/favorite-public")
+                    .header(header::COOKIE, "lumora_session=favorite-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
+
+        let favorites = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/favorites")
+                    .header(header::COOKIE, "lumora_session=favorite-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let favorites: Value =
+            serde_json::from_slice(&to_bytes(favorites.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(favorites["data"]["total"], 0);
     }
 
     #[tokio::test]

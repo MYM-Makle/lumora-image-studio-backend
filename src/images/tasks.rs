@@ -174,47 +174,58 @@ pub(super) async fn retry_task(
             "只有失败任务可以重新生成".into(),
         ));
     }
-    let payload = serde_json::from_str::<TaskPayload>(&request_json)
+    let mut payload = serde_json::from_str::<TaskPayload>(&request_json)
         .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "任务数据无效".into()))?;
-    if kind == "generation" {
-        return create_tasks(
-            state,
-            user,
-            "generation",
-            payload.generation,
-            None,
-            metadata,
-        )
-        .await;
-    }
-    if kind != "edit" {
+    if kind == "edit" {
+        let task_directory = state.config.task_directory.join(id);
+        load_task_inputs(&task_directory, &payload.input_files).await?;
+        if let Some(file_name) = &payload.mask_file {
+            load_task_input(&task_directory, file_name).await?;
+        }
+    } else if kind != "generation" {
         return Err(AppError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "任务类型无效".into(),
         ));
     }
-    let task_directory = state.config.task_directory.join(id);
-    let images = load_task_inputs(&task_directory, &payload.input_files).await?;
-    let mask = if let Some(file_name) = &payload.mask_file {
-        Some(load_task_input(&task_directory, file_name).await?)
-    } else {
-        None
-    };
-    let generation = payload.generation.clone();
-    create_tasks(
-        state,
-        user,
-        "edit",
-        generation,
-        Some(EditRequest {
-            generation: payload.generation,
-            images,
-            mask,
-            batch: false,
-        }),
-        metadata,
-    )
-    .await
+    payload.request_metadata = metadata;
+    let request_json = serde_json::to_string(&payload)
+        .map_err(|_| AppError(StatusCode::INTERNAL_SERVER_ERROR, "任务序列化失败".into()))?;
+    reserve_credits(state, &user.id, 1)?;
+    let queued = write_database(&state.db, |connection| {
+        let now = Utc::now().to_rfc3339();
+        let changed = connection
+            .execute(
+                "UPDATE tasks SET status = 'queued', request_json = ?1, image_id = NULL,
+                   error = NULL, credits_used = 0, created_at = ?2, updated_at = ?2,
+                   confirmed_at = NULL
+                 WHERE id = ?3 AND user_id = ?4 AND status = 'error'",
+                params![request_json, now, id, user.id],
+            )
+            .map_err(internal_error)?;
+        if changed == 0 {
+            return Err(AppError(
+                StatusCode::CONFLICT,
+                "只有失败任务可以重新生成".into(),
+            ));
+        }
+        Ok(())
+    });
+    if let Err(error) = queued {
+        write_database(&state.db, |connection| {
+            connection
+                .execute(
+                    "UPDATE users SET credits_reserved = MAX(credits_reserved - 1, 0)
+                     WHERE id = ?1",
+                    [&user.id],
+                )
+                .map_err(internal_error)?;
+            Ok(())
+        })?;
+        return Err(error);
+    }
+    spawn_task(state.clone(), id.to_string());
+    Ok(vec![id.to_string()])
 }
 
 async fn cleanup_task_directories(state: &AppState, task_ids: &[String]) {

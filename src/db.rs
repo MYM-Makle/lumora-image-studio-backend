@@ -309,6 +309,12 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
            model TEXT NOT NULL,
            created_at TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS favorites (
+           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+           image_id TEXT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+           created_at TEXT NOT NULL,
+           PRIMARY KEY (user_id, image_id)
+         );
          CREATE TABLE IF NOT EXISTS announcements (
            id TEXT PRIMARY KEY,
            title TEXT NOT NULL,
@@ -406,6 +412,8 @@ fn initialize_database(connection: &mut Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
          CREATE INDEX IF NOT EXISTS idx_images_user_created ON images(user_id, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_favorites_user_created
+           ON favorites(user_id, created_at DESC);
          CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_logs(user_id, created_at DESC);
          CREATE INDEX IF NOT EXISTS idx_tasks_user_created ON tasks(user_id, created_at DESC);
          CREATE INDEX IF NOT EXISTS idx_devices_user_seen ON devices(user_id, last_seen_at DESC);

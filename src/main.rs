@@ -147,6 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/images",
             get(images::list_images).delete(images::clear_images),
         )
+        .route("/api/favorites", get(images::list_favorites))
+        .route(
+            "/api/favorites/{id}",
+            put(images::add_favorite).delete(images::remove_favorite),
+        )
         .route("/api/images/generate", post(images::generate_image))
         .route(
             "/api/images/generate/async",

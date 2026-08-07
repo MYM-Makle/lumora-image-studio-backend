@@ -323,9 +323,11 @@ pub(super) async fn store_outputs(
             source: "generated",
             format: file.format.clone(),
             is_public: context.request.is_public,
+            is_favorited: false,
             category: category.into(),
             storage: storage.into(),
             author: None,
+            favorited_at: None,
             reference_images: file
                 .reference_files
                 .iter()

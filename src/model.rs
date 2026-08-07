@@ -145,10 +145,13 @@ pub struct ImageResponse {
     pub source: &'static str,
     pub format: String,
     pub is_public: bool,
+    pub is_favorited: bool,
     pub category: String,
     pub storage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub favorited_at: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reference_images: Vec<String>,
 }
